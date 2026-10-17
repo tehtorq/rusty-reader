@@ -1,0 +1,26 @@
+[package]
+name = "rusty-reader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37"
+ego-tree = "0.11"
+epub = "2.1"
+hyphenation = { version = "0.8.4", features = ["embed_en-us"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rfd = "0.17"
+ron = "0.12.2"
+scraper = "0.27"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Typesetting is heavy work; keep debug builds pleasant to use.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

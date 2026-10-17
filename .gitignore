@@ -1,0 +1,20 @@
+# Build output
+/target
+
+# Rustfmt backups
+**/*.rs.bk
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Local test books and screenshots
+*.epub
+/shots/
