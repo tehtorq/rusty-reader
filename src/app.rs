@@ -11,6 +11,7 @@ use crate::library::{self, Action, Covers};
 use crate::meter::Meter;
 use crate::platform;
 use crate::reader::Reader;
+use crate::speech::{Control, Narrator};
 use crate::store::{Admitted, Store};
 use crate::theme::ThemeKind;
 
@@ -34,6 +35,7 @@ pub struct App {
     applied_theme: Option<ThemeKind>,
     dirty_since: Option<f64>,
     meter: Meter,
+    narrator: Narrator,
 }
 
 impl App {
@@ -57,6 +59,7 @@ impl App {
             applied_theme: None,
             dirty_since: None,
             meter: Meter::default(),
+            narrator: Narrator::default(),
         };
         if app.store.fill_keys() {
             app.store.save();
@@ -174,7 +177,7 @@ impl eframe::App for App {
         let mut back_to_library = false;
         match &mut self.screen {
             Screen::Reading(reader) => {
-                reader.ui(ui, &mut self.store.settings, self.hyphenator.as_ref());
+                reader.ui(ui, &mut self.store.settings, self.hyphenator.as_ref(), &mut self.narrator);
                 if reader.moved {
                     reader.moved = false;
                     if let Some(entry) = self.store.recent_mut(&reader.path) {
@@ -223,6 +226,7 @@ impl eframe::App for App {
             if let Screen::Reading(reader) = std::mem::replace(&mut self.screen, Screen::Library) {
                 self.remember(&reader, now);
             }
+            self.narrator.control(Control::Stop);
             ctx.send_viewport_cmd(egui::ViewportCommand::Title("Rusty Reader".into()));
         }
 
@@ -263,6 +267,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.narrator.halt();
         if let Screen::Reading(reader) = &self.screen
             && let Some(entry) = self.store.recent_mut(&reader.path)
         {

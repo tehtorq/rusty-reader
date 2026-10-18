@@ -9,6 +9,7 @@ pub mod meter;
 pub mod picture;
 pub mod platform;
 pub mod reader;
+pub mod speech;
 pub mod store;
 pub mod theme;
 pub mod viewer;

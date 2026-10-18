@@ -11,7 +11,7 @@ use eframe::egui::{
 use crate::fonts;
 use crate::theme::Palette;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Back,
     Contents,
@@ -20,6 +20,12 @@ pub enum Icon {
     Close,
     List,
     Grid,
+    Listen,
+    Play,
+    Pause,
+    Previous,
+    Next,
+    More,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -67,6 +73,53 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             for (x, y) in [(0.3, 0.3), (0.53, 0.3), (0.3, 0.53), (0.53, 0.53)] {
                 let cell = Rect::from_min_max(at(x, y), at(x + 0.17, y + 0.17));
                 painter.rect_stroke(cell, r, stroke, egui::StrokeKind::Middle);
+            }
+        }
+        Icon::Listen => {
+            // Headphones: a band over two ear cups.
+            let center = at(0.5, 0.54);
+            let r = rect.width() * 0.2;
+            let band = (0..=16)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 16.0);
+                    center + vec2(a.cos(), a.sin()) * r
+                })
+                .collect();
+            painter.add(Shape::line(band, stroke));
+            for x in [0.3, 0.7] {
+                let cup =
+                    Rect::from_center_size(at(x, 0.62), vec2(rect.width() * 0.09, rect.height() * 0.17));
+                painter.rect_filled(cup, CornerRadius::same(2), color);
+            }
+        }
+        Icon::Play => {
+            painter.add(Shape::convex_polygon(
+                vec![at(0.4, 0.33), at(0.68, 0.5), at(0.4, 0.67)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Previous | Icon::Next => {
+            // A bar and a triangle: back a sentence, or on one.
+            let flip = |x: f32| if icon == Icon::Previous { 1.0 - x } else { x };
+            painter.add(Shape::convex_polygon(
+                vec![at(flip(0.36), 0.34), at(flip(0.58), 0.5), at(flip(0.36), 0.66)],
+                color,
+                Stroke::NONE,
+            ));
+            let bar =
+                Rect::from_center_size(at(flip(0.64), 0.5), vec2(rect.width() * 0.055, rect.height() * 0.32));
+            painter.rect_filled(bar, CornerRadius::same(1), color);
+        }
+        Icon::More => {
+            for x in [0.34, 0.5, 0.66] {
+                painter.circle_filled(at(x, 0.5), rect.width() * 0.035, color);
+            }
+        }
+        Icon::Pause => {
+            for x in [0.41, 0.59] {
+                let bar = Rect::from_center_size(at(x, 0.5), vec2(rect.width() * 0.07, rect.height() * 0.32));
+                painter.rect_filled(bar, CornerRadius::same(1), color);
             }
         }
     }
@@ -177,6 +230,32 @@ pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> 
     job.wrap =
         TextWrapping { max_width: width.max(10.0), max_rows: 1, break_anywhere: true, ..Default::default() };
     ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// A row showing one choice of many, with arrows to step back and forth through them.
+/// Returns -1 or 1 when an arrow is pressed.
+pub fn stepper(ui: &mut Ui, id: Id, label: &str, pal: &Palette) -> Option<i32> {
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+    ui.painter().rect_filled(row, CornerRadius::same(10), pal.faint.gamma_multiply(0.6));
+    let mut step = None;
+    for (dir, x, icon_x) in [(-1, row.left(), 0.56), (1, row.right() - 44.0, 0.44)] {
+        let rect = Rect::from_min_size(pos2(x, row.top()), vec2(44.0, row.height()));
+        let response =
+            ui.interact(rect, id.with(dir), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            step = Some(dir);
+        }
+        let color = if hovering(ui, &response) { pal.text } else { pal.muted };
+        let at = |dx: f32, y: f32| {
+            pos2(rect.left() + rect.width() * (icon_x + dx), rect.top() + rect.height() * y)
+        };
+        let tip = if dir < 0 { -0.08 } else { 0.08 };
+        ui.painter()
+            .add(Shape::line(vec![at(0.0, 0.36), at(tip, 0.5), at(0.0, 0.64)], Stroke::new(1.5, color)));
+    }
+    let galley = elided(ui, label, fonts::ui(14.0), pal.text, row.width() - 100.0);
+    ui.painter().galley(row.center() - galley.size() * 0.5, galley, pal.text);
+    step
 }
 
 /// A pill-shaped text button.

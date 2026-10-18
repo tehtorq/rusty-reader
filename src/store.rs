@@ -135,6 +135,18 @@ impl Store {
         }
     }
 
+    /// Note a place reached in a book, straight into the saved state: for the narrator, which
+    /// reads on while the app's own copy of the state may not be looking.
+    pub fn remember_place(path: &Path, chapter: usize, offset: usize, progress: f32) {
+        let mut store = Store::load();
+        if let Some(entry) = store.recent_mut(path) {
+            entry.chapter = chapter;
+            entry.offset = offset;
+            entry.progress = progress;
+            store.save();
+        }
+    }
+
     /// Shelves saved before books had keys learn them, so duplicates can be recognised.
     pub fn fill_keys(&mut self) -> bool {
         let mut changed = false;

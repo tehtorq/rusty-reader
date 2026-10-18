@@ -59,6 +59,12 @@ pub fn refresh_rate() -> Option<f32> {
     }
 }
 
+/// A short tap of the phone's vibration motor, to confirm a long press did something.
+pub fn buzz() {
+    #[cfg(target_os = "android")]
+    android::buzz();
+}
+
 pub fn leave(ctx: &egui::Context) {
     #[cfg(target_os = "android")]
     {
@@ -124,14 +130,222 @@ pub mod android {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
-    use jni::objects::{JObject, JObjectArray, JString, JValue};
-    use jni::{JNIEnv, JavaVM};
+    use std::ffi::c_void;
+
+    use jni::objects::{JClass, JObject, JObjectArray, JString, JValue};
+    use jni::sys::{jfloat, jint, jlong};
+    use jni::{JNIEnv, JavaVM, NativeMethod};
+
+    use crate::speech::{self, Control, Engine, Heard, State, Voice, VoiceInfo};
     use winit::platform::android::activity::AndroidApp;
 
     static APP: OnceLock<AndroidApp> = OnceLock::new();
 
     pub fn set_app(app: AndroidApp) {
         let _ = APP.set(app);
+        register_natives();
+    }
+
+    /// Give Java's `Narration.heard` and `Narration.control` their Rust bodies. (Java can't
+    /// find them by name: the library was loaded by NativeActivity, not `System.loadLibrary`.)
+    fn register_natives() {
+        with_activity(|env, activity| {
+            let loader =
+                env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+            let name = env.new_string("com.rustyreader.Narration")?;
+            let class = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[(&name).into()],
+                )?
+                .l()?;
+            let methods = [
+                NativeMethod {
+                    name: "heard".into(),
+                    sig: "(IJ)V".into(),
+                    fn_ptr: native_heard as *mut c_void,
+                },
+                NativeMethod {
+                    name: "control".into(),
+                    sig: "(I)V".into(),
+                    fn_ptr: native_control as *mut c_void,
+                },
+                NativeMethod {
+                    name: "progress".into(),
+                    sig: "(Ljava/lang/String;F)V".into(),
+                    fn_ptr: native_progress as *mut c_void,
+                },
+                NativeMethod {
+                    name: "failure".into(),
+                    sig: "(Ljava/lang/String;)V".into(),
+                    fn_ptr: native_failure as *mut c_void,
+                },
+            ];
+            env.register_native_methods(JClass::from(class), &methods)
+        });
+    }
+
+    extern "system" fn native_heard(_env: JNIEnv, _class: JClass, kind: jint, id: jlong) {
+        let id = id as u64;
+        speech::heard(match kind {
+            0 => Heard::Started(id),
+            1 => Heard::Done(id),
+            _ => Heard::Failed(id),
+        });
+    }
+
+    extern "system" fn native_progress(mut env: JNIEnv, _class: JClass, voice: JString, fraction: jfloat) {
+        if let Ok(voice) = env.get_string(&voice) {
+            speech::download_progress(&String::from(voice), fraction);
+        }
+    }
+
+    extern "system" fn native_failure(mut env: JNIEnv, _class: JClass, message: JString) {
+        if let Ok(message) = env.get_string(&message) {
+            let message = String::from(message);
+            log::error!("{message}");
+            speech::failure(&message);
+        }
+    }
+
+    extern "system" fn native_control(_env: JNIEnv, _class: JClass, action: jint) {
+        speech::control(match action {
+            0 => Control::Play,
+            1 => Control::Pause,
+            2 => Control::Toggle,
+            4 => Control::Next,
+            5 => Control::Previous,
+            _ => Control::Stop,
+        });
+    }
+
+    /// Android's own text-to-speech, through `Narration.java`.
+    #[derive(Default)]
+    pub struct SystemVoice;
+
+    impl Voice for SystemVoice {
+        fn speak(&mut self, id: u64, text: &str, paragraph_end: bool) {
+            with_activity(|env, activity| {
+                let text = env.new_string(text)?;
+                env.call_method(
+                    activity,
+                    "speak",
+                    "(JLjava/lang/String;Z)V",
+                    &[JValue::Long(id as i64), (&text).into(), JValue::Bool(paragraph_end.into())],
+                )
+                .map(drop)
+            });
+        }
+
+        fn stop(&mut self) {
+            with_activity(|env, activity| env.call_method(activity, "silence", "()V", &[]).map(drop));
+        }
+
+        fn set_rate(&mut self, rate: f32) {
+            with_activity(|env, activity| {
+                env.call_method(activity, "speechRate", "(F)V", &[JValue::Float(rate)]).map(drop)
+            });
+        }
+
+        fn set_language(&mut self, language: &str) {
+            with_activity(|env, activity| {
+                let tag = env.new_string(language)?;
+                env.call_method(activity, "speechLanguage", "(Ljava/lang/String;)V", &[(&tag).into()])
+                    .map(drop)
+            });
+        }
+
+        fn set_voice(&mut self, voice: Option<&str>) {
+            with_activity(|env, activity| {
+                let name = match voice {
+                    Some(v) => env.new_string(v)?.into(),
+                    None => JObject::null(),
+                };
+                env.call_method(activity, "speechVoice", "(Ljava/lang/String;)V", &[(&name).into()]).map(drop)
+            });
+        }
+
+        fn current_voice(&mut self) -> Option<String> {
+            with_activity(|env, activity| {
+                let name =
+                    env.call_method(activity, "speechCurrentVoice", "()Ljava/lang/String;", &[])?.l()?;
+                if name.is_null() {
+                    return Ok(None);
+                }
+                Ok(Some(String::from(env.get_string(&JString::from(name))?)))
+            })
+            .flatten()
+        }
+
+        fn engines(&mut self) -> Vec<Engine> {
+            with_activity(|env, activity| {
+                let list = env.call_method(activity, "speechEngines", "()[Ljava/lang/String;", &[])?.l()?;
+                let list = JObjectArray::from(list);
+                let mut engines = Vec::new();
+                for i in 0..env.get_array_length(&list)? {
+                    let entry = JString::from(env.get_object_array_element(&list, i)?);
+                    let entry = String::from(env.get_string(&entry)?);
+                    if let Some((id, name)) = entry.split_once('\t') {
+                        engines.push(Engine { id: id.into(), name: name.into() });
+                    }
+                }
+                Ok(engines)
+            })
+            .unwrap_or_default()
+        }
+
+        fn set_engine(&mut self, engine: Option<&str>) {
+            with_activity(|env, activity| {
+                let name = match engine {
+                    Some(e) => env.new_string(e)?.into(),
+                    None => JObject::null(),
+                };
+                env.call_method(activity, "speechEngine", "(Ljava/lang/String;)V", &[(&name).into()])
+                    .map(drop)
+            });
+        }
+
+        fn voices(&mut self) -> Vec<VoiceInfo> {
+            with_activity(|env, activity| {
+                let list = env.call_method(activity, "speechVoices", "()[Ljava/lang/String;", &[])?.l()?;
+                let list = JObjectArray::from(list);
+                let mut voices = Vec::new();
+                for i in 0..env.get_array_length(&list)? {
+                    let entry = JString::from(env.get_object_array_element(&list, i)?);
+                    let entry = String::from(env.get_string(&entry)?);
+                    if let [id, language, name] = entry.splitn(3, '\t').collect::<Vec<_>>()[..] {
+                        voices.push(VoiceInfo {
+                            id: id.into(),
+                            language: language.into(),
+                            name: name.into(),
+                        });
+                    }
+                }
+                Ok(voices)
+            })
+            .unwrap_or_default()
+        }
+
+        fn now_playing(&mut self, state: State, title: &str, author: Option<&str>) {
+            let state = match state {
+                State::Idle => 0,
+                State::Playing => 1,
+                State::Paused => 2,
+            };
+            with_activity(|env, activity| {
+                let title = env.new_string(title)?;
+                let author = env.new_string(author.unwrap_or_default())?;
+                env.call_method(
+                    activity,
+                    "nowPlaying",
+                    "(ILjava/lang/String;Ljava/lang/String;)V",
+                    &[JValue::Int(state), (&title).into(), (&author).into()],
+                )
+                .map(drop)
+            });
+        }
     }
 
     pub fn app() -> Option<&'static AndroidApp> {
@@ -166,6 +380,10 @@ pub mod android {
     pub fn refresh_rate() -> Option<f32> {
         with_activity(|env, activity| env.call_method(activity, "refreshRate", "()F", &[])?.f())
             .filter(|&hz| hz > 0.0)
+    }
+
+    pub fn buzz() {
+        with_activity(|env, activity| env.call_method(activity, "buzz", "()V", &[]).map(drop));
     }
 
     pub fn move_to_back() {

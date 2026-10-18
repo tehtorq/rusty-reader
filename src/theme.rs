@@ -225,6 +225,11 @@ pub struct Settings {
     pub show_progress: bool,
     pub animate: bool,
     pub shelf: ShelfView,
+    /// Reading aloud: pace (1.0 is the voice's own) and voice (`None`, the system's choice).
+    pub speech_rate: f32,
+    pub speech_voice: Option<String>,
+    /// The speech engine (Android), or `None` for the app's choice.
+    pub voice_engine: Option<String>,
 }
 
 impl Default for Settings {
@@ -241,6 +246,9 @@ impl Default for Settings {
             show_progress: true,
             animate: true,
             shelf: ShelfView::List,
+            speech_rate: 1.0,
+            speech_voice: None,
+            voice_engine: None,
         }
     }
 }

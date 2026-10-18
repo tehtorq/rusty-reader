@@ -32,6 +32,9 @@ public class ReaderActivity extends NativeActivity {
     private static final String TAG = "RustyReader";
     private static final int PICK_BOOK = 1;
 
+    /** Reading aloud; Rust calls the methods below from its narrator thread. */
+    private final Narration narration = new Narration(this);
+
     /** Books that arrived together, published once all of them have been copied. */
     private final ConcurrentLinkedQueue<String[]> arrived = new ConcurrentLinkedQueue<>();
 
@@ -63,6 +66,13 @@ public class ReaderActivity extends NativeActivity {
     }
 
     @Override
+    protected void onDestroy() {
+        // Closing the app closes the book, voice and all.
+        if (isFinishing()) Narration.closed();
+        super.onDestroy();
+    }
+
+    @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         receive(intent);
@@ -72,6 +82,24 @@ public class ReaderActivity extends NativeActivity {
     public float refreshRate() {
         Display display = getDisplay();
         return display == null ? 0f : display.getRefreshRate();
+    }
+
+    // Called from Rust's narrator: see Narration.
+    public void speak(long id, String text, boolean paragraphEnd) { narration.speak(id, text, paragraphEnd); }
+    public void silence() { narration.silence(); }
+    public void speechRate(float rate) { narration.rate(rate); }
+    public void speechLanguage(String tag) { narration.language(tag); }
+    public void speechVoice(String name) { narration.voice(name); }
+    public String[] speechVoices() { return narration.voices(); }
+    public void speechEngine(String name) { narration.engine(name); }
+    public String[] speechEngines() { return narration.engines(); }
+    public String speechCurrentVoice() { return narration.currentVoice(); }
+    public void nowPlaying(int state, String title, String author) { narration.nowPlaying(state, title, author); }
+
+    /** Called from Rust: a short buzz, as for any long press. */
+    public void buzz() {
+        runOnUiThread(() -> getWindow().getDecorView()
+                .performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS));
     }
 
     /** Called from Rust: show the system document picker. */

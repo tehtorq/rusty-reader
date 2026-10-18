@@ -6,6 +6,21 @@
 
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
 
+    <!-- Reading aloud with the screen off: a media-playback foreground service, which keeps
+         the processor awake between sentences. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Natural voices are downloaded the first time each is used. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 11+ hides other apps unless asked for: here, the text-to-speech engines. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <!-- Rust does the reading; a small NativeActivity subclass (java/) receives books from
          the document picker, "Open with" and "Share". -->
     <application
@@ -42,5 +57,10 @@
                 <data android:mimeType="application/epub+zip" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="com.rustyreader.NarrationService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

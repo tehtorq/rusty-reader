@@ -25,6 +25,7 @@ struct State {
     covers: Option<library::Covers>,
     shelf: Vec<RecentBook>,
     meter: rusty_reader::meter::Meter,
+    narrator: rusty_reader::speech::Narrator,
 }
 
 fn main() {
@@ -52,6 +53,7 @@ fn main() {
         covers: None,
         shelf: demo_shelf(&path, &book.title, book.author.as_deref()),
         meter: Default::default(),
+        narrator: Default::default(),
     };
     // RR_STEP_DT=0.0166 simulates real frame times (for gestures); the default jumps ahead.
     let step_dt = std::env::var("RR_STEP_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25);
@@ -68,7 +70,7 @@ fn main() {
                     let covers = s.covers.get_or_insert_with(|| library::Covers::new(ui.ctx()));
                     library::ui(ui, &s.shelf, s.settings.shelf, covers, s.settings.theme, None);
                 } else {
-                    s.reader.ui(ui, &mut s.settings, s.hyph.as_ref());
+                    s.reader.ui(ui, &mut s.settings, s.hyph.as_ref(), &mut s.narrator);
                 }
                 s.meter.record(ui.ctx(), std::time::Duration::ZERO);
             },

@@ -40,7 +40,10 @@ pub struct Frag {
     /// Laid out again through egui's galley cache whenever it is painted, so it always
     /// refers to the current glyph atlas; we only keep what is needed to place it.
     pub job: LayoutJob,
-    width: f32,
+    /// The characters of the chapter it shows (empty for list markers); a hyphen added at a
+    /// line break is not among them.
+    pub chars: Range<usize>,
+    pub width: f32,
     ascent: f32,
     descent: f32,
 }
@@ -162,7 +165,7 @@ impl Shaper {
         let mut job = LayoutJob::default();
         job.append(text, 0.0, self.format(fmt));
         job.wrap.max_width = f32::INFINITY;
-        Frag { pos: Vec2::ZERO, job, width: galley.size().x, ascent, descent }
+        Frag { pos: Vec2::ZERO, job, chars: 0..0, width: galley.size().x, ascent, descent }
     }
 
     fn width(&mut self, fonts: &mut FontsView<'_>, fmt: Fmt, text: &str) -> f32 {
@@ -191,6 +194,8 @@ fn metrics(galley: &Galley) -> (f32, f32) {
 
 struct Run {
     text: String,
+    /// Position of its first character in the block's own text.
+    src: usize,
     fmt: Fmt,
     rise: f32,
 }
@@ -214,10 +219,11 @@ fn runs_for(block: &Block, base: Fmt, lead_words: usize) -> Vec<Run> {
     let mut in_word = false;
     let size = base.size();
 
-    let push = |text: char, fmt: Fmt, rise: f32, runs: &mut Vec<Run>| match runs.last_mut() {
+    let push = |text: char, src: usize, fmt: Fmt, rise: f32, runs: &mut Vec<Run>| match runs.last_mut() {
         Some(last) if last.fmt == fmt && last.rise == rise => last.text.push(text),
-        _ => runs.push(Run { text: text.to_string(), fmt, rise }),
+        _ => runs.push(Run { text: text.to_string(), src, fmt, rise }),
     };
+    let mut src = 0;
 
     for span in &block.spans {
         let Style { italic, bold, mono, small_caps, sup, sub } = span.style;
@@ -236,6 +242,8 @@ fn runs_for(block: &Block, base: Fmt, lead_words: usize) -> Vec<Run> {
             rise = if sup { -size * 0.36 } else { size * 0.16 };
         }
         for ch in span.text.chars() {
+            let at = src;
+            src += 1;
             if ch.is_whitespace() {
                 if in_word {
                     words_seen += 1;
@@ -248,11 +256,11 @@ fn runs_for(block: &Block, base: Fmt, lead_words: usize) -> Vec<Run> {
             if caps && ch.is_lowercase() {
                 let small = Fmt { tracking_q: (fmt.size() * 4.0) as i32, ..fmt.with_size(fmt.size() * 0.8) };
                 for upper in ch.to_uppercase() {
-                    push(upper, small, rise, &mut runs);
+                    push(upper, at, small, rise, &mut runs);
                 }
             } else {
                 let f = if caps { Fmt { tracking_q: (fmt.size() * 3.0) as i32, ..fmt } } else { fmt };
-                push(ch, f, rise, &mut runs);
+                push(ch, at, f, rise, &mut runs);
             }
         }
     }
@@ -536,12 +544,15 @@ impl Setter<'_, '_, '_> {
             .enumerate()
             .map(|(i, (run, range, x))| {
                 let run_ref = &para.runs[run];
+                let first = run_ref.src + run_ref.text[..range.start].chars().count();
                 let mut text = run_ref.text[range].to_owned();
+                let chars = first..first + text.chars().count();
                 if hyphen_at_end && i + 1 == n {
                     text.push('-');
                 }
                 let mut frag = self.shaper.frag(self.fonts, run_ref.fmt, &text);
                 frag.pos.x = offset + x;
+                frag.chars = chars;
                 (frag, run_ref.rise)
             })
             .collect();
@@ -907,7 +918,15 @@ pub fn layout_chapter(
                 }
                 let lines = setter.set(block, &bf, p.width, lead_words);
                 let count = lines.len();
-                for (li, (height, frags, chars)) in lines.into_iter().enumerate() {
+                for (li, (height, mut frags, chars)) in lines.into_iter().enumerate() {
+                    // Counting characters line by line drifts (a line break swallows its
+                    // space), so where a line has words, its first one says where it starts.
+                    let start = frags.iter().filter(|f| !f.chars.is_empty()).map(|f| f.chars.start).min();
+                    for frag in &mut frags {
+                        if !frag.chars.is_empty() {
+                            frag.chars = offset + frag.chars.start..offset + frag.chars.end;
+                        }
+                    }
                     elements.push(Element {
                         y,
                         height,
@@ -916,7 +935,7 @@ pub fn layout_chapter(
                         line: li,
                         lines: count,
                         keep_with_next: bf.keep_with_next,
-                        offset: offset + chars.min(block.char_len() - 1),
+                        offset: offset + start.unwrap_or(chars).min(block.char_len() - 1),
                     });
                     y += height;
                 }

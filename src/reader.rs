@@ -15,6 +15,8 @@ use crate::book::Book;
 use crate::fonts;
 use crate::layout::{self, ChapterLayout, Content, Params, Shaper};
 use crate::picture::Picture;
+use crate::platform;
+use crate::speech::{self, Control, Narrator, Spot, State, Status, VoicePrefs};
 use crate::theme::{Measure, Palette, Settings, Spacing, ThemeKind, Typeface};
 use crate::viewer::Viewer;
 use crate::widgets::{self, Icon, lerp_color};
@@ -55,7 +57,25 @@ pub struct Reader {
     images: HashMap<String, ImageSlot>,
     /// Where each illustration on the page at rest was drawn, last frame: taps there open it.
     page_images: Vec<(Rect, String)>,
+    /// Where each word on the page at rest was drawn, with the character it starts at.
+    page_words: Vec<(Rect, usize)>,
     viewer: Option<Viewer>,
+    /// The sentence being read aloud that the page last moved to.
+    followed: Option<Spot>,
+    /// Read aloud from here: (chapter, offset).
+    listen_from: Option<(usize, usize)>,
+    /// The play/pause button was pressed.
+    listen_toggle: bool,
+    /// A button on the reading-aloud player was pressed.
+    player_action: Option<Control>,
+    /// A sentence just chosen to read from, lit at once (since when), before the voice starts.
+    flash: Option<(Spot, f64)>,
+    /// The narrator's state, for the play/pause button.
+    listening: State,
+    /// When a voice download failed, to say so for a while.
+    download_failed: Option<f64>,
+    /// The last reading-aloud error shown, and since when.
+    error_shown: Option<(u32, f64)>,
     chrome: bool,
     sheet: Sheet,
     slide: Option<Slide>,
@@ -88,7 +108,16 @@ impl Reader {
             shaper: Shaper::new(Typeface::Literata),
             images: HashMap::new(),
             page_images: Vec::new(),
+            page_words: Vec::new(),
             viewer: None,
+            followed: None,
+            listen_from: None,
+            listen_toggle: false,
+            player_action: None,
+            flash: None,
+            listening: State::Idle,
+            download_failed: None,
+            error_shown: None,
             chrome: false,
             sheet: Sheet::None,
             slide: None,
@@ -109,7 +138,13 @@ impl Reader {
         self.book.progress(self.chapter, self.offset.min(self.book.chapters[self.chapter].chars))
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, settings: &mut Settings, hyph: Option<&Standard>) {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        settings: &mut Settings,
+        hyph: Option<&Standard>,
+        narrator: &mut Narrator,
+    ) {
         let ctx = ui.ctx().clone();
         // Our hyphenation patterns are English; leave other languages unbroken.
         let english = self.book.language.as_deref().is_none_or(|l| l.starts_with("en"));
@@ -138,6 +173,10 @@ impl Reader {
             vec2(params.width, params.height),
         );
 
+        let status = narrator.status();
+        self.listening = status.state;
+        let before = (self.chapter, self.offset);
+        let speech_before = voice_prefs(settings);
         if self.viewer.is_none() {
             self.handle_input(ui, &ctx, hyph, settings, screen, now);
         }
@@ -165,17 +204,74 @@ impl Reader {
         };
         let painter = ui.painter().clone();
         self.page_images.clear();
+        self.page_words.clear();
         let at_rest = offset.abs() < 0.5;
         let origin = column.min + vec2(offset, 0.0);
-        self.paint_page(&painter, &ctx, self.chapter, page, origin, &pal, fade, at_rest);
+        // A sentence just chosen lights up straight away; then the voice's own place takes over.
+        let flash = self.flash.filter(|(_, at)| now - at < 1.2).map(|(spot, _)| spot);
+        if flash.is_some() {
+            ctx.request_repaint_after_secs(0.1);
+        }
+        let spot = flash.or(status.at.filter(|_| status.state != State::Idle));
+        self.paint_page(&painter, &ctx, self.chapter, page, origin, &pal, fade, at_rest, spot);
         if let Some(((chapter, page), shift)) = neighbour {
             let origin = column.min + vec2(offset + shift, 0.0);
-            self.paint_page(&painter, &ctx, chapter, page, origin, &pal, fade, false);
+            self.paint_page(&painter, &ctx, chapter, page, origin, &pal, fade, false, spot);
+        }
+
+        // A first-time voice download holds up the reading: say so (and, for a while, if it
+        // failed).
+        let failed = status.download.as_ref().is_some_and(|(_, f)| *f < 0.0);
+        if !failed {
+            self.download_failed = None;
+        } else if self.download_failed.is_none() {
+            self.download_failed = Some(now);
+        }
+        // So does anything else going wrong, for long enough to read.
+        if let Some((_, count)) = &status.error
+            && self.error_shown.is_none_or(|(seen, _)| seen != *count)
+        {
+            self.error_shown = Some((*count, now));
+        }
+        let error = status.error.as_ref().filter(|_| self.error_shown.is_some_and(|(_, at)| now - at < 12.0));
+        let note = match (&status.download, self.download_failed) {
+            _ if error.is_some() => {
+                ctx.request_repaint_after_secs(1.0);
+                error.map(|(message, _)| message.clone())
+            }
+            (Some(_), Some(at)) if now - at < 6.0 => {
+                ctx.request_repaint_after_secs(1.0);
+                Some("Couldn't download the voice: check the connection".to_owned())
+            }
+            (Some((_, fraction)), None) if status.state == State::Playing => {
+                Some(format!("Downloading the voice · {:.0}%", fraction * 100.0))
+            }
+            _ => None,
+        };
+        if let Some(text) = note {
+            let galley = ui.fonts_mut(|f| f.layout(text, fonts::ui(13.0), pal.text, column.width() - 28.0));
+            let pill = Rect::from_center_size(
+                pos2(screen.center().x, column.bottom() - 24.0),
+                galley.size() + vec2(28.0, 16.0),
+            );
+            painter.rect_filled(pill, CornerRadius::same(16), pal.surface);
+            painter.rect_stroke(
+                pill,
+                CornerRadius::same(16),
+                Stroke::new(1.0, pal.faint),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(pill.center() - galley.size() * 0.5, galley, pal.text);
         }
 
         let chrome_t = ctx.animate_bool_with_time(Id::unique("chrome"), self.chrome, 0.2);
+        let player = self.listening != State::Idle && self.sheet == Sheet::None && self.viewer.is_none();
+        let player_t = ctx.animate_bool_with_time(Id::unique("player"), player && !self.chrome, 0.2);
         if settings.show_progress {
-            self.paint_footer(ui, screen, column, &pal, (1.0 - chrome_t) * fade);
+            self.paint_footer(ui, screen, column, &pal, (1.0 - chrome_t) * (1.0 - player_t) * fade);
+        }
+        if player_t > 0.0 {
+            self.player(&ctx, screen, column, &pal, player_t);
         }
         if chrome_t > 0.0 {
             self.top_bar(&ctx, screen, &pal, chrome_t);
@@ -185,8 +281,9 @@ impl Reader {
                 self.bottom_bar(&ctx, screen, &pal, bottom_t);
             }
         }
-        self.settings_sheet(&ctx, screen, settings, &pal);
+        self.settings_sheet(&ctx, screen, settings, &pal, &status);
         self.contents_sheet(&ctx, screen, &pal);
+        self.listen(&ctx, hyph, settings, narrator, &status, before, speech_before, screen.width(), now);
         if let Some(viewer) = &mut self.viewer {
             let open = match self.images.get(viewer.key()) {
                 Some(ImageSlot::Ready(picture)) => viewer.ui(&ctx, screen, picture, &pal, now),
@@ -218,6 +315,152 @@ impl Reader {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Reading aloud
+
+    /// Start, pause and steer the narrator, and keep the page on the sentence being read.
+    #[allow(clippy::too_many_arguments)]
+    fn listen(
+        &mut self,
+        ctx: &egui::Context,
+        hyph: Option<&Standard>,
+        settings: &Settings,
+        narrator: &mut Narrator,
+        status: &Status,
+        before: (usize, usize),
+        speech_before: VoicePrefs,
+        width: f32,
+        now: f64,
+    ) {
+        let play = |narrator: &mut Narrator, reader: &Self, chapter: usize, offset: usize| {
+            let (book, path) = (reader.book.clone(), reader.path.clone());
+            narrator.play(ctx, book, path, chapter, offset, voice_prefs(settings));
+        };
+        let here = self.layouts.get(&self.chapter).map(|l| l.page_at(self.offset));
+        let on_this_page = |spot: Spot| {
+            spot.chapter == self.chapter
+                && self.layouts.get(&spot.chapter).is_some_and(|l| {
+                    let page = &l.pages[l.page_at(self.offset)];
+                    let next = l.pages.get(l.page_at(self.offset) + 1).map_or(usize::MAX, |p| p.offset);
+                    spot.end > page.offset && spot.start < next
+                })
+        };
+
+        if let Some(control) = self.player_action.take() {
+            narrator.control(control);
+        }
+        if let Some((chapter, offset)) = self.listen_from.take() {
+            if let Some(sentence) =
+                speech::sentences(&self.book.chapters[chapter]).into_iter().find(|s| s.end > offset)
+            {
+                self.flash = Some((Spot { chapter, start: sentence.start, end: sentence.end }, now));
+                ctx.request_repaint();
+            }
+            play(narrator, self, chapter, offset);
+        } else if std::mem::take(&mut self.listen_toggle) {
+            match status.state {
+                State::Playing => narrator.control(Control::Pause),
+                // Carry on, unless the page has moved on since: then read from here.
+                State::Paused if status.at.is_some_and(on_this_page) => narrator.control(Control::Play),
+                _ => play(narrator, self, self.chapter, self.offset),
+            }
+        } else if status.state == State::Playing && (self.chapter, self.offset) != before {
+            // Turning the page while listening reads on from the new page.
+            play(narrator, self, self.chapter, self.offset);
+        }
+        if voice_prefs(settings) != speech_before {
+            narrator.set_prefs(voice_prefs(settings));
+        }
+
+        // Follow the reading, a page at a time.
+        let Some(spot) = status.at.filter(|_| status.state != State::Idle) else {
+            self.followed = None;
+            return;
+        };
+        if self.followed == Some(spot) || self.drag.is_some() || self.scrub.is_some() {
+            return;
+        }
+        self.followed = Some(spot);
+        if on_this_page(spot) {
+            return;
+        }
+        self.ensure(ctx, hyph, spot.chapter);
+        let Some(layout) = self.layouts.get(&spot.chapter) else { return };
+        let target = layout.page_at(spot.start);
+        let next = self.neighbour(ctx, hyph, 1);
+        if next == Some((spot.chapter, target)) && here.is_some() {
+            self.turn(ctx, hyph, 1, width, settings.animate, now);
+        } else {
+            let offset = self.layouts[&spot.chapter].pages[target].offset;
+            self.jump(spot.chapter, offset);
+        }
+    }
+
+    /// The word on the page nearest `pos`, if one is within `reach`: where its sentence is.
+    fn word_near(&self, pos: Pos2, reach: f32) -> Option<usize> {
+        self.page_words
+            .iter()
+            .map(|(rect, offset)| (rect.distance_to_pos(pos), *offset))
+            .filter(|&(distance, _)| distance <= reach)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, offset)| offset)
+    }
+
+    /// While reading aloud, a small player in the bottom margin: the menus, back a sentence,
+    /// play or pause, on a sentence, and stop.
+    fn player(&mut self, ctx: &egui::Context, screen: Rect, column: Rect, pal: &Palette, t: f32) {
+        let play = if self.listening == State::Playing { Icon::Pause } else { Icon::Play };
+        // Play/pause in the middle, where a thumb looks for it.
+        let buttons = [Icon::More, Icon::Previous, play, Icon::Next, Icon::Close];
+        let margin = (screen.bottom() - column.bottom()).max(56.0);
+        let size = vec2(buttons.len() as f32 * 44.0 + 12.0, 46.0);
+        let center = pos2(screen.center().x, screen.bottom() - margin * 0.5 + (1.0 - t) * 10.0);
+        let pill = Rect::from_center_size(center, size);
+        egui::Area::new(Id::unique("player-area"))
+            .order(Order::Foreground)
+            .fixed_pos(pill.min)
+            // Live from the moment it starts to appear, so an early tap can't fall through to
+            // the page; only once it is fading away does it stop answering.
+            .interactable(self.listening != State::Idle && !self.chrome)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                // The layer must cover the pill for taps on it to reach it at all; taps between
+                // the buttons then belong to the player, not the page beneath.
+                ui.set_min_size(pill.size());
+                ui.interact(pill, Id::unique("player-bg"), Sense::click());
+                let shadow = egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 16,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if pal.dark { 120 } else { 28 }),
+                };
+                let painter = ui.painter();
+                painter.add(shadow.as_shape(pill, CornerRadius::same(23)));
+                painter.rect_filled(pill, CornerRadius::same(23), pal.surface);
+                painter.rect_stroke(
+                    pill,
+                    CornerRadius::same(23),
+                    Stroke::new(1.0, pal.faint),
+                    egui::StrokeKind::Inside,
+                );
+                for (i, icon) in buttons.into_iter().enumerate() {
+                    let at = pos2(pill.left() + 6.0 + 22.0 + 44.0 * i as f32, pill.center().y);
+                    let id = Id::unique(("player", i));
+                    if widgets::icon_button(ui, Rect::from_center_size(at, vec2(40.0, 40.0)), id, icon, pal)
+                        .clicked()
+                    {
+                        match icon {
+                            Icon::Previous => self.player_action = Some(Control::Previous),
+                            Icon::Next => self.player_action = Some(Control::Next),
+                            Icon::More => self.chrome = true,
+                            Icon::Close => self.player_action = Some(Control::Stop),
+                            _ => self.listen_toggle = true,
+                        }
+                    }
+                }
+            });
     }
 
     // -----------------------------------------------------------------------------------
@@ -407,20 +650,42 @@ impl Reader {
                     self.slide = Some(Slide { base: o, start: now, duration: 0.28 });
                 }
             }
+            if surface.secondary_clicked()
+                && let Some(pos) = surface.interact_pointer_pos()
+                && let Some(offset) = self.word_near(pos, self.params.map_or(60.0, |p| p.size * 3.0))
+            {
+                // A long press reads aloud from the nearest sentence: on a word, or beside one.
+                self.listen_from = Some((self.chapter, offset));
+                platform::buzz();
+            }
             if surface.clicked() {
                 let pos = surface.interact_pointer_pos();
                 let x = pos.map_or(0.5, |p| (p.x - screen.left()) / width);
-                // Taps on an illustration (away from the page-turning edges) take a closer look.
+                // Taps near the edges turn the page, except on phones, where a swipe does and a
+                // stray tap at the edge shouldn't.
+                let edge = if cfg!(target_os = "android") {
+                    0
+                } else if x < 0.28 {
+                    -1
+                } else if x > 0.72 {
+                    1
+                } else {
+                    0
+                };
+                // Taps on an illustration (away from any page-turning edge) take a closer look.
                 let image = pos.and_then(|p| self.page_images.iter().find(|(r, _)| r.contains(p)));
-                if let (false, Some((rect, key))) = (self.chrome || !(0.28..=0.72).contains(&x), image) {
+                if let (false, Some((rect, key))) = (self.chrome || edge != 0, image) {
                     self.viewer = Some(Viewer::new(key.clone(), *rect, now));
                 } else if self.chrome {
                     self.chrome = false;
-                } else if pos.is_some() {
-                    if x < 0.28 {
-                        self.turn(ctx, hyph, -1, width, animate, now);
-                    } else if x > 0.72 {
-                        self.turn(ctx, hyph, 1, width, animate, now);
+                } else if let Some(pos) = pos {
+                    if edge != 0 {
+                        self.turn(ctx, hyph, edge, width, animate, now);
+                    } else if let Some(offset) =
+                        self.word_near(pos, 3.0).filter(|_| self.listening != State::Idle)
+                    {
+                        // While reading aloud, tapping a sentence reads from there.
+                        self.listen_from = Some((self.chapter, offset));
                     } else {
                         self.chrome = true;
                     }
@@ -499,6 +764,7 @@ impl Reader {
                             }
                         }
                         Key::Enter | Key::M => self.chrome = !self.chrome,
+                        Key::P => self.listen_toggle = true,
                         Key::T => self.toggle_sheet(Sheet::Contents),
                         Key::S => self.toggle_sheet(Sheet::Settings),
                         Key::F11 | Key::F => toggle_fullscreen(ctx),
@@ -538,17 +804,44 @@ impl Reader {
         pal: &Palette,
         alpha: f32,
         record: bool,
+        spot: Option<Spot>,
     ) {
         let Some(layout) = self.layouts.get(&chapter) else { return };
         let Some(page) = layout.pages.get(page) else { return };
         let text = pal.text.gamma_multiply(alpha);
+        let spot = spot.filter(|s| s.chapter == chapter);
+        let highlight = pal.accent.gamma_multiply(if pal.dark { 0.3 } else { 0.16 } * alpha);
         for element in &layout.elements[page.start..page.end] {
             let y = origin.y + element.y - page.top + page.shift;
             match &element.content {
                 Content::Line(frags) => {
+                    // The sentence being read aloud sits on a soft band.
+                    if let Some(spot) = spot {
+                        let said =
+                            frags.iter().filter(|f| f.chars.start < spot.end && f.chars.end > spot.start);
+                        let span = said.fold(None, |span: Option<(f32, f32)>, f| {
+                            let (l, r) = (f.pos.x, f.pos.x + f.width);
+                            Some(span.map_or((l, r), |(a, b)| (a.min(l), b.max(r))))
+                        });
+                        if let Some((l, r)) = span {
+                            let pad = layout.params.size * 0.22;
+                            let band = Rect::from_min_max(
+                                pos2(origin.x + l - pad, y),
+                                pos2(origin.x + r + pad, y + element.height),
+                            );
+                            painter.rect_filled(band, CornerRadius::same((pad * 1.2) as u8), highlight);
+                        }
+                    }
                     for frag in frags {
                         let pos = widgets::snap(ctx, pos2(origin.x + frag.pos.x, y + frag.pos.y));
                         painter.galley(pos, painter.layout_job(frag.job.clone()), text);
+                        if record && !frag.chars.is_empty() {
+                            let rect = Rect::from_min_size(
+                                pos2(origin.x + frag.pos.x, y),
+                                vec2(frag.width, element.height),
+                            );
+                            self.page_words.push((rect, frag.chars.start));
+                        }
                     }
                 }
                 Content::Image { key, x, size } => {
@@ -642,27 +935,8 @@ impl Reader {
                 {
                     self.close = true;
                 }
-                // Phones are always fullscreen, so there the button would do nothing.
-                let fullscreen = !cfg!(target_os = "android");
-                let mut x = bar.right() - 30.0;
-                if fullscreen {
-                    if widgets::icon_button(ui, button(x), Id::unique("fullscreen"), Icon::Fullscreen, pal)
-                        .clicked()
-                    {
-                        toggle_fullscreen(ctx);
-                    }
-                    x -= 44.0;
-                }
-                if widgets::icon_button(ui, button(x), Id::unique("type"), Icon::Type, pal).clicked() {
-                    self.toggle_sheet(Sheet::Settings);
-                }
-                x -= 44.0;
-                if widgets::icon_button(ui, button(x), Id::unique("contents"), Icon::Contents, pal).clicked()
-                {
-                    self.toggle_sheet(Sheet::Contents);
-                }
-
-                let title_width = (bar.width() - 2.0 * 150.0).max(40.0);
+                // Everything else lives in the bottom bar, within reach of a thumb.
+                let title_width = (bar.width() - 2.0 * 70.0).max(40.0);
                 let galley =
                     widgets::elided(ui, &self.book.title, fonts::serif(15.0, true), pal.text, title_width);
                 ui.painter().galley(bar.center() - galley.size() * 0.5, galley, pal.text);
@@ -670,7 +944,7 @@ impl Reader {
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context, screen: Rect, pal: &Palette, t: f32) {
-        let height = 100.0;
+        let height = 152.0;
         let bar = Rect::from_min_size(
             pos2(screen.left(), screen.bottom() - height + (1.0 - t) * 12.0),
             vec2(screen.width(), height),
@@ -688,7 +962,7 @@ impl Reader {
 
                 let track_w = (screen.width() - 64.0).min(560.0);
                 let x0 = bar.center().x - track_w * 0.5;
-                let track_y = bar.top() + 54.0;
+                let track_y = bar.top() + 64.0;
                 let track = Rect::from_min_size(pos2(x0, track_y - 14.0), vec2(track_w, 28.0));
                 let response = ui
                     .interact(track, Id::unique("scrubber"), Sense::click_and_drag())
@@ -735,13 +1009,41 @@ impl Reader {
                     }
                     None => (self.section_title().map(str::to_owned), self.progress()),
                 };
-                if let Some(label) = label {
-                    let galley = widgets::elided(ui, &label, fonts::serif(15.0, true), pal.text, track_w);
-                    ui.painter().galley(
-                        pos2(bar.center().x - galley.size().x * 0.5, bar.top() + 18.0),
-                        galley,
-                        pal.text,
-                    );
+                // The chapter's title opens the contents.
+                let label = label.unwrap_or_else(|| "Contents".to_owned());
+                let galley = widgets::elided(ui, &label, fonts::serif(15.0, true), pal.text, track_w - 40.0);
+                let icon = 22.0;
+                let width = icon + 6.0 + galley.size().x;
+                let row =
+                    Rect::from_center_size(pos2(bar.center().x, bar.top() + 28.0), vec2(width + 28.0, 36.0));
+                let response = ui
+                    .interact(row, Id::unique("chapter-title"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                let hover = ctx.animate_bool_with_time(
+                    Id::unique("chapter-title-hover"),
+                    widgets::hovering(ui, &response),
+                    0.12,
+                );
+                let painter = ui.painter();
+                if hover > 0.0 {
+                    painter.rect_filled(row, CornerRadius::same(18), pal.faint.gamma_multiply(0.6 * hover));
+                }
+                let left = row.center().x - width * 0.5;
+                let icon_rect =
+                    Rect::from_center_size(pos2(left + icon * 0.5, row.center().y), vec2(icon, icon));
+                widgets::paint_icon(
+                    painter,
+                    icon_rect,
+                    Icon::Contents,
+                    lerp_color(pal.muted, pal.text, hover),
+                );
+                painter.galley(
+                    pos2(left + icon + 6.0, row.center().y - galley.size().y * 0.5),
+                    galley,
+                    pal.text,
+                );
+                if response.clicked() {
+                    self.toggle_sheet(Sheet::Contents);
                 }
                 let small = fonts::ui(12.0);
                 let pages_text = match self.pages_left_in_section() {
@@ -765,10 +1067,43 @@ impl Reader {
                     small,
                     pal.muted,
                 );
+
+                // Actions, in a row along the bottom.
+                let listen = match self.listening {
+                    State::Playing => Icon::Pause,
+                    State::Paused => Icon::Play,
+                    State::Idle => Icon::Listen,
+                };
+                let mut actions = vec![(Id::unique("listen"), listen), (Id::unique("type"), Icon::Type)];
+                // Phones are always fullscreen, so there the button would do nothing.
+                if !cfg!(target_os = "android") {
+                    actions.push((Id::unique("fullscreen"), Icon::Fullscreen));
+                }
+                let spacing = 64.0;
+                let first = bar.center().x - spacing * (actions.len() - 1) as f32 * 0.5;
+                for (i, (id, icon)) in actions.into_iter().enumerate() {
+                    let at = pos2(first + spacing * i as f32, bar.top() + 126.0);
+                    if widgets::icon_button(ui, Rect::from_center_size(at, vec2(44.0, 44.0)), id, icon, pal)
+                        .clicked()
+                    {
+                        match icon {
+                            Icon::Type => self.toggle_sheet(Sheet::Settings),
+                            Icon::Fullscreen => toggle_fullscreen(ctx),
+                            _ => self.listen_toggle = true,
+                        }
+                    }
+                }
             });
     }
 
-    fn settings_sheet(&mut self, ctx: &egui::Context, screen: Rect, settings: &mut Settings, pal: &Palette) {
+    fn settings_sheet(
+        &mut self,
+        ctx: &egui::Context,
+        screen: Rect,
+        settings: &mut Settings,
+        pal: &Palette,
+        status: &Status,
+    ) {
         let t = ctx.animate_bool_with_time(Id::unique("settings-sheet"), self.sheet == Sheet::Settings, 0.22);
         if t <= 0.0 {
             return;
@@ -783,13 +1118,13 @@ impl Reader {
                 sheet_frame(pal).show(ui, |ui| {
                     ui.set_width(width - 44.0);
                     if screen.height() >= 780.0 {
-                        settings_contents(ui, settings, pal);
+                        settings_contents(ui, settings, pal, status);
                     } else {
                         let height = screen.height() - 90.0;
                         egui::ScrollArea::vertical()
                             .max_height(height)
                             .min_scrolled_height(height)
-                            .show(ui, |ui| settings_contents(ui, settings, pal));
+                            .show(ui, |ui| settings_contents(ui, settings, pal, status));
                     }
                 });
             });
@@ -958,7 +1293,7 @@ fn sheet_frame(pal: &Palette) -> egui::Frame {
         .inner_margin(egui::Margin::same(22))
 }
 
-fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette) {
+fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette, status: &Status) {
     widgets::section_label(ui, "Theme", pal);
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 74.0), Sense::hover());
     let cell = row.width() / ThemeKind::ALL.len() as f32;
@@ -1047,6 +1382,66 @@ fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette) {
         pal,
     );
     widgets::toggle_row(ui, Id::unique("animate"), "Animate page turns", &mut settings.animate, pal);
+
+    widgets::section_label(ui, "Reading aloud", pal);
+    const RATES: [f32; 5] = [0.8, 1.0, 1.2, 1.5, 2.0];
+    let names = ["0.8×", "1×", "1.2×", "1.5×", "2×"];
+    let selected = RATES
+        .iter()
+        .enumerate()
+        .min_by(|a, b| (a.1 - settings.speech_rate).abs().total_cmp(&(b.1 - settings.speech_rate).abs()))
+        .map_or(1, |(i, _)| i);
+    if let Some(i) = widgets::segmented(ui, Id::unique("speech-rate"), &names, &[], selected, pal) {
+        settings.speech_rate = RATES[i];
+    }
+    // On Android: the speech engine (Google's, the phone maker's, or another installed one).
+    let engines = &status.engines;
+    if engines.len() > 1 {
+        ui.add_space(8.0);
+        let current =
+            settings.voice_engine.as_ref().and_then(|e| engines.iter().position(|x| &x.id == e)).unwrap_or(0);
+        if let Some(step) = widgets::stepper(ui, Id::unique("engine"), &engines[current].name, pal) {
+            let next = (current as i32 + step).rem_euclid(engines.len() as i32) as usize;
+            settings.voice_engine = Some(engines[next].id.clone());
+            // Voices belong to their engine.
+            settings.speech_voice = None;
+        }
+    }
+    let voices = &status.voices;
+    if voices.len() > 1 {
+        ui.add_space(8.0);
+        // Show the voice actually speaking, and step from it to the next.
+        let speaking = settings.speech_voice.as_ref().or(status.voice.as_ref());
+        let current = speaking.and_then(|v| voices.iter().position(|x| &x.id == v));
+        let mut label = current.map_or("Default voice".to_owned(), |i| voices[i].name.clone());
+        if let (Some(i), Some((voice, fraction))) = (current, &status.download)
+            && &voices[i].id == voice
+        {
+            // "Alan (UK) · 60 MB" becomes "Alan (UK) · downloading 34%".
+            let name = voices[i].name.split(" · ").next().unwrap_or_default();
+            label = if *fraction < 0.0 {
+                format!("{name} · couldn't download")
+            } else {
+                format!("{name} · downloading {:.0}%", fraction * 100.0)
+            };
+        }
+        if let Some(step) = widgets::stepper(ui, Id::unique("voice"), &label, pal) {
+            let next = match current {
+                Some(i) => (i as i32 + step).rem_euclid(voices.len() as i32) as usize,
+                None if step > 0 => 0,
+                None => voices.len() - 1,
+            };
+            settings.speech_voice = Some(voices[next].id.clone());
+        }
+    }
+}
+
+fn voice_prefs(settings: &Settings) -> VoicePrefs {
+    VoicePrefs {
+        rate: settings.speech_rate,
+        voice: settings.speech_voice.clone(),
+        engine: settings.voice_engine.clone(),
+    }
 }
 
 fn top_margin(screen: Rect) -> f32 {
