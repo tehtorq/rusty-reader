@@ -70,14 +70,15 @@ impl Meter {
             )
         };
         let at = ctx.content_rect().left_top() + vec2(12.0, 12.0);
-        egui::Area::new(Id::unique("frame-meter")).order(Order::Debug).fixed_pos(at).interactable(false).show(
-            ctx,
-            |ui| {
+        egui::Area::new(Id::unique("frame-meter"))
+            .order(Order::Debug)
+            .fixed_pos(at)
+            .interactable(false)
+            .show(ctx, |ui| {
                 let galley = ui.painter().layout_no_wrap(lines, FontId::monospace(12.0), Color32::WHITE);
                 let rect = egui::Rect::from_min_size(pos2(at.x, at.y), galley.size() + vec2(16.0, 12.0));
                 ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::from_black_alpha(200));
                 ui.painter().galley(rect.min + vec2(8.0, 6.0), galley, Color32::WHITE);
-            },
-        );
+            });
     }
 }

@@ -6,6 +6,7 @@ pub mod fonts;
 pub mod layout;
 pub mod library;
 pub mod meter;
+pub mod picture;
 pub mod platform;
 pub mod reader;
 pub mod store;

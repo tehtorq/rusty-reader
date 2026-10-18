@@ -1,10 +1,9 @@
 //! A closer look at an illustration: it grows out of the page, and can be pinched, wheeled,
 //! dragged and double-tapped like any image viewer.
 
-use eframe::egui::{
-    self, Color32, Id, Key, Modifiers, Order, Pos2, Rect, Sense, TextureHandle, Vec2, pos2, vec2,
-};
+use eframe::egui::{self, Color32, Id, Key, Modifiers, Order, Pos2, Rect, Sense, Vec2, vec2};
 
+use crate::picture::Picture;
 use crate::theme::Palette;
 use crate::widgets::{self, Icon};
 
@@ -46,7 +45,7 @@ impl Viewer {
         &mut self,
         ctx: &egui::Context,
         screen: Rect,
-        texture: &TextureHandle,
+        picture: &Picture,
         pal: &Palette,
         now: f64,
     ) -> bool {
@@ -61,7 +60,7 @@ impl Viewer {
         let presence = opening * (1.0 - closing.unwrap_or(0.0));
 
         let bounds = screen.shrink(12.0);
-        let image = texture.size_vec2();
+        let image = picture.size();
         let fit = image * (bounds.width() / image.x).min(bounds.height() / image.y);
         let center = bounds.center();
 
@@ -85,12 +84,7 @@ impl Viewer {
                 let painter = ui.painter();
                 painter.rect_filled(viewport, 0.0, pal.bg.gamma_multiply(presence));
                 let tint = if pal.dark { Color32::from_gray(205) } else { Color32::WHITE };
-                painter.image(
-                    texture.id(),
-                    rect,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    tint.gamma_multiply(opening.max(0.001)),
-                );
+                picture.paint(painter, rect, tint.gamma_multiply(opening.max(0.001)));
 
                 if presence > 0.0 {
                     ui.set_opacity(presence);

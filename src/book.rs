@@ -12,6 +12,8 @@ use eframe::egui::ColorImage;
 use epub::doc::{EpubDoc, NavPoint};
 use scraper::{ElementRef, Html, Node};
 
+use crate::picture;
+
 /// Inline character styling.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
@@ -114,8 +116,9 @@ impl BookImage {
         Some(BookImage { bytes: bytes.into(), size: [w as usize, h as usize] })
     }
 
-    /// Decode to pixels, scaling very large images down. Slow; call off the UI thread.
-    pub fn decode(&self) -> Option<ColorImage> {
+    /// Decode to pixels, scaling very large images down, as a [`picture::ladder`]. Slow; call
+    /// off the UI thread.
+    pub fn decode(&self) -> Option<Vec<ColorImage>> {
         let image = image::load_from_memory(&self.bytes).ok()?;
         const MAX: u32 = 2048;
         let image = if image.width() > MAX || image.height() > MAX {
@@ -123,9 +126,7 @@ impl BookImage {
         } else {
             image
         };
-        let rgba = image.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+        Some(picture::ladder(image))
     }
 }
 
@@ -149,8 +150,8 @@ pub fn metadata(path: &Path) -> Option<Metadata> {
     Some(Metadata { title, author, key })
 }
 
-/// Just the cover, scaled down for the shelf. Opens the archive afresh; call off the UI thread.
-pub fn cover_thumbnail(path: &Path, max_height: u32) -> Option<ColorImage> {
+/// Just the cover, scaled down for the shelf, as a [`picture::ladder`]. Opens the archive afresh; call off the UI thread.
+pub fn cover_thumbnail(path: &Path, max_height: u32) -> Option<Vec<ColorImage>> {
     let mut doc = EpubDoc::new(path).ok()?;
     let bytes = match doc.get_cover() {
         Some((bytes, _)) => bytes,
@@ -176,9 +177,7 @@ pub fn cover_thumbnail(path: &Path, max_height: u32) -> Option<ColorImage> {
     } else {
         image
     };
-    let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+    Some(picture::ladder(image))
 }
 
 impl Book {

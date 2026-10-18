@@ -7,13 +7,14 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, CornerRadius, Event, Id, Key, LayerId, MouseWheelUnit, Order,
-    Painter, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, TouchPhase, Ui, pos2, vec2,
+    Painter, Pos2, Rect, Sense, Stroke, TouchPhase, Ui, pos2, vec2,
 };
 use hyphenation::Standard;
 
 use crate::book::Book;
 use crate::fonts;
 use crate::layout::{self, ChapterLayout, Content, Params, Shaper};
+use crate::picture::Picture;
 use crate::theme::{Measure, Palette, Settings, Spacing, ThemeKind, Typeface};
 use crate::viewer::Viewer;
 use crate::widgets::{self, Icon, lerp_color};
@@ -30,8 +31,8 @@ enum Sheet {
 
 /// Illustrations are decoded on a background thread the first time they're needed.
 enum ImageSlot {
-    Loading(Receiver<Option<ColorImage>>),
-    Ready(TextureHandle),
+    Loading(Receiver<Option<Vec<ColorImage>>>),
+    Ready(Picture),
     Failed,
 }
 
@@ -188,7 +189,7 @@ impl Reader {
         self.contents_sheet(&ctx, screen, &pal);
         if let Some(viewer) = &mut self.viewer {
             let open = match self.images.get(viewer.key()) {
-                Some(ImageSlot::Ready(texture)) => viewer.ui(&ctx, screen, texture, &pal, now),
+                Some(ImageSlot::Ready(picture)) => viewer.ui(&ctx, screen, picture, &pal, now),
                 _ => false,
             };
             if !open {
@@ -555,25 +556,18 @@ impl Reader {
                     let slot = self.images.get_mut(key).expect("requested");
                     if let ImageSlot::Loading(rx) = slot {
                         match rx.try_recv() {
-                            Ok(Some(image)) => {
-                                *slot = ImageSlot::Ready(ctx.load_texture(key, image, TextureOptions::LINEAR))
-                            }
+                            Ok(Some(image)) => *slot = ImageSlot::Ready(Picture::new(ctx, key, image)),
                             Ok(None) | Err(TryRecvError::Disconnected) => *slot = ImageSlot::Failed,
                             Err(TryRecvError::Empty) => {}
                         }
                     }
-                    let ImageSlot::Ready(texture) = slot else { continue };
+                    let ImageSlot::Ready(picture) = slot else { continue };
                     let rect = Rect::from_min_size(widgets::snap(ctx, pos2(origin.x + x, y)), *size);
                     if record {
                         self.page_images.push((rect, key.clone()));
                     }
                     let tint = if pal.dark { Color32::from_gray(205) } else { Color32::WHITE };
-                    painter.image(
-                        texture.id(),
-                        rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        tint.gamma_multiply(alpha),
-                    );
+                    picture.paint(painter, rect, tint.gamma_multiply(alpha));
                 }
                 Content::Ornament => {
                     let center = pos2(origin.x + layout.params.width * 0.5, y + element.height * 0.5);

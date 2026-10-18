@@ -6,12 +6,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui::epaint::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, CornerRadius, Id, Rect, Sense, Shadow, Stroke, TextureHandle,
-    TextureOptions, Ui, pos2, vec2,
+    self, Align, Align2, Color32, ColorImage, CornerRadius, Id, Rect, Sense, Shadow, Stroke, Ui, pos2, vec2,
 };
 
 use crate::book;
 use crate::fonts;
+use crate::picture::Picture;
 use crate::store::RecentBook;
 use crate::theme::{Palette, ShelfView, ThemeKind};
 use crate::widgets::{self, Icon};
@@ -26,7 +26,7 @@ pub enum Action {
 
 enum Cover {
     Pending,
-    Ready(TextureHandle),
+    Ready(Picture),
     Missing,
 }
 
@@ -34,7 +34,7 @@ enum Cover {
 pub struct Covers {
     slots: HashMap<PathBuf, Cover>,
     requests: Sender<PathBuf>,
-    results: Receiver<(PathBuf, Option<ColorImage>)>,
+    results: Receiver<(PathBuf, Option<Vec<ColorImage>>)>,
 }
 
 impl Covers {
@@ -44,7 +44,8 @@ impl Covers {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             for path in inbox {
-                let image = book::cover_thumbnail(&path, 480);
+                // Tall enough for the largest grid cover on a sharp phone screen.
+                let image = book::cover_thumbnail(&path, 1024);
                 if outbox.send((path, image)).is_err() {
                     break;
                 }
@@ -59,7 +60,7 @@ impl Covers {
             let cover = match image {
                 Some(image) => {
                     let name = format!("cover:{}", path.display());
-                    Cover::Ready(ctx.load_texture(name, image, TextureOptions::LINEAR))
+                    Cover::Ready(Picture::new(ctx, &name, image))
                 }
                 None => Cover::Missing,
             };
@@ -459,13 +460,9 @@ fn paint_cover(
     pal: &Palette,
 ) {
     match covers.get(&book.path) {
-        Cover::Ready(texture) => {
+        Cover::Ready(picture) => {
             let tint = if pal.dark { Color32::from_gray(215) } else { Color32::WHITE };
-            egui::Image::from_texture(texture)
-                .uv(fill_uv(texture.size_vec2(), rect.size()))
-                .corner_radius(radius)
-                .tint(tint)
-                .paint_at(ui, rect);
+            picture.paint_cropped(ui, rect, fill_uv(picture.size(), rect.size()), radius, tint);
         }
         Cover::Missing => plain_cover(ui, rect, book),
         Cover::Pending => {
