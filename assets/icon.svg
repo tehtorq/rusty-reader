@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <!-- An old man reading in his rocking chair, in lamplight. Android draws the same art from
+       android/res/drawable/ic_launcher_foreground.xml; regenerate icon.png with
+       magick -background none -density 384 assets/icon.svg -resize 256x256 assets/icon.png -->
+  <rect x="6" y="6" width="96" height="96" rx="22" fill="#24201C"/>
+  <circle cx="54" cy="54" r="30" fill="#D9A066"/>
+  <g fill="none" stroke="#24201C" stroke-linecap="round" stroke-linejoin="round">
+    <!-- chair -->
+    <path d="M32 73 Q52 81 77 71" stroke-width="3"/>
+    <path d="M40 60 L37 74.5 M60 60.5 L63.5 75.5" stroke-width="2.6"/>
+    <path d="M37.5 60 L62 60" stroke-width="3.2"/>
+    <path d="M40.5 60 L33.5 32 M31 33.5 Q34.5 29.5 38.5 32" stroke-width="3"/>
+    <path d="M58 52 L60.5 60" stroke-width="2.2"/>
+    <!-- legs -->
+    <path d="M45 56.5 L61 54" stroke-width="7"/>
+    <path d="M61 54 L63.5 71" stroke-width="5.4"/>
+    <path d="M62 72.2 L69 72.2" stroke-width="3.6"/>
+  </g>
+  <!-- hunched body -->
+  <path fill="#24201C" d="M43 38 C38.5 41 37.5 48 39.5 54 C40.5 58 43 60 47 60 L50 59
+           C51.5 55 52 50 50.5 45 C49.5 41.5 47 39 43 38 Z"/>
+  <!-- bowed head, beard -->
+  <circle cx="46.5" cy="32.5" r="5.3" fill="#24201C"/>
+  <path fill="#24201C" d="M47.5 35.5 C50 36 52 37 51.5 38.5 C50.5 41 47.5 41.5 45 40 Z"/>
+  <!-- arm -->
+  <path d="M46 43 L49.5 51 L57.5 46" fill="none" stroke="#24201C" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- open book -->
+  <path fill="#F6EEDC" d="M63 46.5 C60.5 44.8 57.6 44.6 55.2 45.6 L54.6 37.6 C57.2 36.4 60.4 36.8 63 38.6 Z
+                          M63 46.5 C65.5 44.8 68.4 44.6 70.8 45.6 L71.4 37.6 C68.8 36.4 65.6 36.8 63 38.6 Z"/>
+  <path d="M63 38.8 L63 46.3" stroke="#B9824B" stroke-width="0.8"/>
+</svg>
