@@ -3,7 +3,7 @@
 //! cargo run --example screenshot -- BOOK.epub OUT_DIR [commands…]
 //!
 //! Commands: `ch:N` jump to chapter, `next`/`prev` turn a page, `key:NAME` press a key,
-//! `theme:NAME`, `size:WxH`, `font:NAME`, `shot:NAME` save a PNG.
+//! `theme:NAME`, `size:WxH`, `font:NAME`, `library`, `view:list|covers`, `tap:X,Y`, `rclick:X,Y`, `flick:X,Y0,Y1`, `steps:N`, `wait:MS`, `shot:NAME` save a PNG.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use hyphenation::{Language, Load, Standard};
 use rusty_reader::book::Book;
 use rusty_reader::reader::Reader;
 use rusty_reader::store::RecentBook;
-use rusty_reader::theme::{Settings, ThemeKind, Typeface};
+use rusty_reader::theme::{Settings, ShelfView, ThemeKind, Typeface};
 use rusty_reader::{fonts, library};
 
 struct State {
@@ -22,6 +22,9 @@ struct State {
     reader: Reader,
     settings: Settings,
     hyph: Option<Standard>,
+    covers: Option<library::Covers>,
+    shelf: Vec<RecentBook>,
+    meter: rusty_reader::meter::Meter,
 }
 
 fn main() {
@@ -46,8 +49,14 @@ fn main() {
         reader: Reader::new(book.clone(), path.clone(), 0, 0),
         settings: Settings::default(),
         hyph: Standard::from_embedded(Language::EnglishUS).ok(),
+        covers: None,
+        shelf: demo_shelf(&path, &book.title, book.author.as_deref()),
+        meter: Default::default(),
     };
+    // RR_STEP_DT=0.0166 simulates real frame times (for gestures); the default jumps ahead.
+    let step_dt = std::env::var("RR_STEP_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25);
     let mut harness = Harness::builder()
+        .with_step_dt(step_dt)
         .with_size([780.0, 1000.0])
         .with_pixels_per_point(1.0)
         .with_context_setup(fonts::install)
@@ -56,11 +65,12 @@ fn main() {
             |ui, s: &mut State| {
                 s.settings.theme.palette().apply(ui.ctx());
                 if s.library {
-                    let recents = demo_shelf();
-                    library::ui(ui, &recents, s.settings.theme, None);
+                    let covers = s.covers.get_or_insert_with(|| library::Covers::new(ui.ctx()));
+                    library::ui(ui, &s.shelf, s.settings.shelf, covers, s.settings.theme, None);
                 } else {
                     s.reader.ui(ui, &mut s.settings, s.hyph.as_ref());
                 }
+                s.meter.record(ui.ctx(), std::time::Duration::ZERO);
             },
             state,
         );
@@ -94,26 +104,75 @@ fn main() {
                 harness.set_size(egui::vec2(w.parse().unwrap(), h.parse().unwrap()));
             }
             "library" => harness.state_mut().library = true,
-            "tap" => {
+            "view" => {
+                harness.state_mut().settings.shelf =
+                    if value == "covers" { ShelfView::Covers } else { ShelfView::List };
+                // Give the cover thread a moment.
+                for _ in 0..20 {
+                    harness.run_steps(1);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+            "tap" | "rclick" => {
                 let (x, y) = value.split_once(',').unwrap();
                 let pos = egui::pos2(x.parse().unwrap(), y.parse().unwrap());
+                let button =
+                    if name == "tap" { egui::PointerButton::Primary } else { egui::PointerButton::Secondary };
                 harness.event(egui::Event::PointerMoved(pos));
                 harness.run_steps(1);
                 for pressed in [true, false] {
                     harness.event(egui::Event::PointerButton {
                         pos,
-                        button: egui::PointerButton::Primary,
+                        button,
                         pressed,
                         modifiers: Default::default(),
                     });
                     harness.run_steps(1);
                 }
             }
+            "flick" => {
+                // flick:X,FROM_Y,TO_Y — a touch drag over three frames, then let go.
+                let v: Vec<f32> = value.split(',').map(|v| v.parse().unwrap()).collect();
+                let (x, y0, y1) = (v[0], v[1], v[2]);
+                let touch = |phase, y: f32| egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(1),
+                    phase,
+                    pos: egui::pos2(x, y),
+                    force: None,
+                };
+                let press = |pressed, y: f32| egui::Event::PointerButton {
+                    pos: egui::pos2(x, y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                harness.event(touch(egui::TouchPhase::Start, y0));
+                harness.event(egui::Event::PointerMoved(egui::pos2(x, y0)));
+                harness.event(press(true, y0));
+                harness.step();
+                for k in 1..=3 {
+                    let y = y0 + (y1 - y0) * k as f32 / 3.0;
+                    harness.event(touch(egui::TouchPhase::Move, y));
+                    harness.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+                    harness.step();
+                }
+                harness.event(touch(egui::TouchPhase::End, y1));
+                harness.event(press(false, y1));
+                harness.event(egui::Event::PointerGone);
+                harness.step();
+            }
+            "steps" => harness.run_steps(value.parse().unwrap()),
+            // wait:MS — real time, for background work such as image decoding.
+            "wait" => {
+                std::thread::sleep(std::time::Duration::from_millis(value.parse().unwrap()));
+                harness.run_steps(2);
+            }
             "swipe" => {
-                // swipe:FROM_X,TO_X at mid-height, over a few frames.
-                let (a, b) = value.split_once(',').unwrap();
-                let (a, b): (f32, f32) = (a.parse().unwrap(), b.parse().unwrap());
-                let y = 500.0;
+                // swipe:FROM_X,TO_X[,Y] (mid-height by default), over a few frames.
+                let parts: Vec<f32> = value.split(',').map(|v| v.parse().unwrap()).collect();
+                let (a, b) = (parts[0], parts[1]);
+                let y = parts.get(2).copied().unwrap_or(500.0);
                 harness.event(egui::Event::PointerMoved(egui::pos2(a, y)));
                 harness.run_steps(1);
                 harness.event(egui::Event::PointerButton {
@@ -157,7 +216,7 @@ fn main() {
     }
 }
 
-fn demo_shelf() -> Vec<RecentBook> {
+fn demo_shelf(real: &std::path::Path, title: &str, author: Option<&str>) -> Vec<RecentBook> {
     let book = |title: &str, author: &str, progress: f32| RecentBook {
         path: PathBuf::from(title),
         title: title.to_owned(),
@@ -166,8 +225,13 @@ fn demo_shelf() -> Vec<RecentBook> {
         offset: 0,
         progress,
         opened: 0,
+        key: None,
     };
+    let mut first = book(title, author.unwrap_or(""), 0.31);
+    first.path = real.to_owned();
+    first.author = author.map(str::to_owned);
     vec![
+        first,
         book("Pride and Prejudice", "Jane Austen", 0.66),
         book("Frankenstein; Or, The Modern Prometheus", "Mary Wollstonecraft Shelley", 0.12),
         book("Alice's Adventures in Wonderland", "Lewis Carroll", 1.0),

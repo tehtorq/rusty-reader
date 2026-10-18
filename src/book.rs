@@ -129,6 +129,58 @@ impl BookImage {
     }
 }
 
+/// What the shelf needs to know about a book, without reading the book itself.
+pub struct Metadata {
+    pub title: String,
+    pub author: Option<String>,
+    /// Recognises the same book under another file name: its identifier (an ISBN or UUID)
+    /// plus its title, as some publishers reuse one placeholder identifier for every book.
+    /// Without an identifier, title and author have to do.
+    pub key: String,
+}
+
+pub fn metadata(path: &Path) -> Option<Metadata> {
+    let doc = EpubDoc::new(path).ok()?;
+    let title = collapse_whitespace(&doc.get_title().filter(|t| !t.trim().is_empty())?);
+    let author = doc.mdata("creator").map(|m| collapse_whitespace(&m.value)).filter(|a| !a.is_empty());
+    let identifier = doc.unique_identifier.as_deref().map(str::trim).filter(|i| !i.is_empty());
+    let second = identifier.map(str::to_owned).or_else(|| author.clone()).unwrap_or_default();
+    let key = format!("{}|{}", title.to_lowercase(), second.to_lowercase());
+    Some(Metadata { title, author, key })
+}
+
+/// Just the cover, scaled down for the shelf. Opens the archive afresh; call off the UI thread.
+pub fn cover_thumbnail(path: &Path, max_height: u32) -> Option<ColorImage> {
+    let mut doc = EpubDoc::new(path).ok()?;
+    let bytes = match doc.get_cover() {
+        Some((bytes, _)) => bytes,
+        None => {
+            // No declared cover: fall back to an image that calls itself one.
+            let mut candidates: Vec<String> = doc
+                .resources
+                .iter()
+                .filter(|(id, res)| {
+                    res.mime.starts_with("image/")
+                        && (id.to_lowercase().contains("cover")
+                            || path_to_string(&res.path).to_lowercase().contains("cover"))
+                })
+                .map(|(_, res)| path_to_string(&res.path))
+                .collect();
+            candidates.sort();
+            doc.get_resource_by_path(candidates.first()?)?
+        }
+    };
+    let image = image::load_from_memory(&bytes).ok()?;
+    let image = if image.height() > max_height {
+        image.resize(u32::MAX, max_height, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
 impl Book {
     pub fn open(path: &Path) -> Result<Book, String> {
         let mut doc = EpubDoc::new(path).map_err(|e| format!("Could not open this book ({e})"))?;
@@ -422,7 +474,9 @@ impl<'a> Builder<'a> {
                 return;
             }
             "img" | "image" => {
-                if let Some(src) = e.attr("src").or_else(|| e.attr("href")) {
+                // SVG covers use `xlink:href`, which a namespace-strict lookup would miss.
+                let any_ns = |name: &str| e.attrs.iter().find(|(k, _)| &*k.local == name).map(|(_, v)| &**v);
+                if let Some(src) = any_ns("src").or_else(|| any_ns("href")) {
                     self.flush(ctx);
                     let path = resolve(&self.base, src);
                     self.push_block(BlockKind::Image(path), Vec::new(), ctx);

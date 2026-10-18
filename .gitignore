@@ -18,3 +18,10 @@ Thumbs.db
 # Local test books and screenshots
 *.epub
 /shots/
+
+# Android: stray packages, signing keys and local SDK paths
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties

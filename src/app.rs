@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -7,9 +7,11 @@ use hyphenation::{Language, Load, Standard};
 
 use crate::book::Book;
 use crate::fonts;
-use crate::library::{self, Action};
+use crate::library::{self, Action, Covers};
+use crate::meter::Meter;
+use crate::platform;
 use crate::reader::Reader;
-use crate::store::Store;
+use crate::store::{Admitted, Store};
 use crate::theme::ThemeKind;
 
 enum Screen {
@@ -28,26 +30,76 @@ pub struct App {
     loading: Option<Loading>,
     message: Option<(String, bool, f64)>,
     hyphenator: Option<Standard>,
+    covers: Covers,
     applied_theme: Option<ThemeKind>,
     dirty_since: Option<f64>,
+    meter: Meter,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> App {
         fonts::install(&cc.egui_ctx);
+        if cfg!(target_os = "android") {
+            // Scroll like an Android list rather than an iPhone one: stop at the ends instead of
+            // rubber-banding, and coast a little less after a flick.
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.spacing.scroll.kinetic.rubber_band = false;
+                style.spacing.scroll.kinetic.decay_time = 0.35;
+            });
+        }
         let mut app = App {
             store: Store::load(),
             screen: Screen::Library,
             loading: None,
             message: None,
             hyphenator: Standard::from_embedded(Language::EnglishUS).ok(),
+            covers: Covers::new(&cc.egui_ctx),
             applied_theme: None,
             dirty_since: None,
+            meter: Meter::default(),
         };
+        if app.store.fill_keys() {
+            app.store.save();
+        }
+        app.shelve_found();
         if let Some(path) = initial {
             app.open(&cc.egui_ctx, path);
         }
         app
+    }
+
+    /// Pick up books copied into the books folder (on platforms that have one).
+    fn shelve_found(&mut self) {
+        let found = platform::found_books();
+        let added = found.iter().filter(|p| matches!(self.store.admit(p, false), Admitted::Added(_))).count();
+        if added > 0 {
+            self.store.save();
+        }
+    }
+
+    /// Books arriving together: a single one opens straight away (at your place, if it is
+    /// already on the shelf), several go onto the shelf.
+    fn import(&mut self, ctx: &egui::Context, books: Vec<PathBuf>, now: f64) {
+        let books: Vec<PathBuf> = books.into_iter().filter(|p| platform::is_epub(p)).collect();
+        if books.is_empty() {
+            return;
+        }
+        let admitted: Vec<Admitted> = books.iter().map(|p| self.store.admit(p, true)).collect();
+        self.store.save();
+        if let [Admitted::Added(path) | Admitted::Already(path)] = &admitted[..] {
+            self.open(ctx, path.clone());
+            return;
+        }
+        let added = admitted.iter().filter(|a| matches!(a, Admitted::Added(_))).count();
+        let already = admitted.len() - added;
+        let books = |n: usize| if n == 1 { "1 book".to_owned() } else { format!("{n} books") };
+        let message = match (added, already) {
+            (_, 0) => format!("Added {} to your shelf", books(added)),
+            (0, _) => "Those books are already on your shelf".to_owned(),
+            (_, 1) => format!("Added {}; 1 was already on your shelf", books(added)),
+            (_, _) => format!("Added {}; {already} were already on your shelf", books(added)),
+        };
+        self.message = Some((message, false, now));
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -62,10 +114,9 @@ impl App {
         self.message = None;
     }
 
-    fn pick(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("EPUB books", &["epub"]).pick_file() {
-            self.open(ctx, path);
-        }
+    fn pick(&mut self, ctx: &egui::Context, now: f64) {
+        let books = platform::pick_books();
+        self.import(ctx, books, now);
     }
 
     fn poll_loading(&mut self, ctx: &egui::Context, now: f64) {
@@ -99,6 +150,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
 
@@ -110,11 +162,11 @@ impl eframe::App for App {
         // Books dropped onto the window.
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        if let Some(path) = dropped.into_iter().find(|p| is_epub(p)) {
-            self.open(&ctx, path);
-        }
+        self.import(&ctx, dropped, now);
+        let picked = platform::take_picked_books();
+        self.import(&ctx, picked, now);
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
-            self.pick(&ctx);
+            self.pick(&ctx, now);
         }
         self.poll_loading(&ctx, now);
 
@@ -145,18 +197,24 @@ impl eframe::App for App {
                 let action = library::ui(
                     ui,
                     &self.store.recents,
+                    self.store.settings.shelf,
+                    &mut self.covers,
                     self.store.settings.theme,
                     status.as_ref().map(|(m, e)| (m.as_str(), *e)),
                 );
                 match action {
                     Some(Action::Open(path)) => self.open(&ctx, path),
-                    Some(Action::Pick) => self.pick(&ctx),
+                    Some(Action::Pick) => self.pick(&ctx, now),
                     Some(Action::Forget(i)) => {
-                        self.store.recents.remove(i);
+                        self.store.forget(i);
                         self.store.save();
                     }
                     Some(Action::Theme(theme)) => self.store.settings.theme = theme,
+                    Some(Action::View(view)) => self.store.settings.shelf = view,
                     None => {}
+                }
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::BrowserBack)) {
+                    platform::leave(&ctx);
                 }
             }
         }
@@ -179,6 +237,29 @@ impl eframe::App for App {
                 ctx.request_repaint_after_secs(1.6);
             }
         }
+        self.meter.record(&ctx, started.elapsed());
+    }
+
+    /// The page colour reaches every edge, behind the camera cut-out and gesture bar too;
+    /// only the content keeps clear of them.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(insets) = platform::safe_area(ctx) {
+            raw_input.safe_area_insets = Some(insets);
+        }
+        // Phones rarely say goodbye: when the app loses focus it may never come back, so
+        // write down the reading position now rather than when the debounce expires.
+        let blurred = raw_input.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)));
+        let refocused = raw_input.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)));
+        if blurred && self.dirty_since.take().is_some() {
+            self.store.save();
+        }
+        if refocused && matches!(self.screen, Screen::Library) {
+            self.shelve_found();
+        }
     }
 
     fn on_exit(&mut self) {
@@ -191,8 +272,4 @@ impl eframe::App for App {
         }
         self.store.save();
     }
-}
-
-fn is_epub(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("epub"))
 }

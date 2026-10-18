@@ -18,6 +18,8 @@ pub enum Icon {
     Type,
     Fullscreen,
     Close,
+    List,
+    Grid,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -55,13 +57,31 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             painter.line_segment([at(0.35, 0.35), at(0.65, 0.65)], stroke);
             painter.line_segment([at(0.65, 0.35), at(0.35, 0.65)], stroke);
         }
+        Icon::List => {
+            for y in [0.34, 0.5, 0.66] {
+                painter.line_segment([at(0.3, y), at(0.7, y)], stroke);
+            }
+        }
+        Icon::Grid => {
+            let r = CornerRadius::same(1);
+            for (x, y) in [(0.3, 0.3), (0.53, 0.3), (0.3, 0.53), (0.53, 0.53)] {
+                let cell = Rect::from_min_max(at(x, y), at(x + 0.17, y + 0.17));
+                painter.rect_stroke(cell, r, stroke, egui::StrokeKind::Middle);
+            }
+        }
     }
+}
+
+/// Whether to show hover feedback. A touchscreen has no hover: the finger that starts a
+/// scroll would otherwise light up whatever happens to be under it.
+pub fn hovering(ui: &Ui, response: &Response) -> bool {
+    response.hovered() && !ui.input(|i| i.has_touch_screen())
 }
 
 /// A round, borderless icon button.
 pub fn icon_button(ui: &mut Ui, rect: Rect, id: Id, icon: Icon, pal: &Palette) -> Response {
     let response = ui.interact(rect, id, Sense::click());
-    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), response.hovered(), 0.12);
+    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), hovering(ui, &response), 0.12);
     if hover > 0.0 {
         ui.painter().circle_filled(rect.center(), rect.width() * 0.5, pal.faint.gamma_multiply(hover));
     }
@@ -165,7 +185,7 @@ pub fn pill_button(ui: &mut Ui, id: Id, label: &str, pal: &Palette) -> Response 
     let size = vec2(galley.size().x + 36.0, 40.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), response.hovered(), 0.12);
+    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), hovering(ui, &response), 0.12);
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(20), pal.faint.gamma_multiply(0.4 + 0.6 * hover));
     painter.galley(
@@ -188,4 +208,117 @@ pub fn hairline(ui: &Ui, y: f32, x: impl Into<egui::Rangef>, color: Color32) {
 pub fn snap(ctx: &egui::Context, p: Pos2) -> Pos2 {
     let ppp = ctx.pixels_per_point();
     pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Flick-scrolling, for vertical lists on touchscreens.
+///
+/// egui judges a flick by the finger's average speed over its last 0.1 s, which a flick (that
+/// accelerates until the finger leaves the glass) always undershoots, and a second flick
+/// replaces the glide rather than adding to it. Here the release speed comes from just the
+/// last few frames, flicks in the same direction stack, and a touch stops the glide dead.
+#[derive(Clone, Default)]
+struct Flick {
+    /// Glide speed, in points per second; positive scrolls down.
+    vel: f32,
+    /// The glide's speed when a finger landed on it, for a flick to build on.
+    carried: f32,
+    /// Recent (time, pointer y) while a finger drags the list.
+    samples: Vec<(f64, f32)>,
+    tracking: bool,
+    offset: f32,
+    max_offset: f32,
+}
+
+/// Decay time constant of a glide, in seconds.
+const FLICK_DECAY: f32 = 0.6;
+/// Only the last this-many seconds of a drag count towards its release speed.
+const FLICK_WINDOW: f64 = 0.05;
+const FLICK_MIN_SPEED: f32 = 150.0;
+const FLICK_MAX_SPEED: f32 = 9000.0;
+
+pub fn flick_scroll<R>(
+    ui: &mut Ui,
+    id: Id,
+    area: egui::ScrollArea,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let mut flick: Flick = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let (time, frame_dt, pressed, down, released, pos) = ui.input(|i| {
+        (
+            i.time,
+            i.stable_dt,
+            i.pointer.any_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.any_released(),
+            i.pointer.latest_pos(),
+        )
+    });
+
+    let dt = frame_dt.min(0.05);
+
+    // Glide, unless a finger is on the glass.
+    let mut area = area;
+    if pressed {
+        flick.carried = flick.vel;
+    }
+    if pressed || down {
+        flick.vel = 0.0;
+    } else if flick.vel != 0.0 {
+        flick.offset += flick.vel * dt;
+        flick.vel *= (-dt / FLICK_DECAY).exp();
+        if flick.offset <= 0.0 || flick.offset >= flick.max_offset || flick.vel.abs() < 10.0 {
+            flick.offset = flick.offset.clamp(0.0, flick.max_offset.max(0.0));
+            flick.vel = 0.0;
+        }
+        area = area.vertical_scroll_offset(flick.offset);
+        ui.ctx().request_repaint();
+    }
+
+    // The glide is ours; egui's own would run on top of it.
+    let output = ui.scope(|ui| {
+        ui.spacing_mut().scroll.kinetic.decay_time = 0.0;
+        area.show(ui, add_contents)
+    });
+    let output = output.inner;
+    flick.offset = output.state.clamped_offset().y;
+
+    flick.max_offset = output.content_size.y - output.inner_rect.height();
+
+    // Follow the finger, and measure it as it lets go.
+    let touch = ui.input(|i| i.has_touch_screen());
+    if touch && pressed && pos.is_some_and(|p| output.inner_rect.contains(p)) {
+        flick.tracking = true;
+        flick.samples.clear();
+    }
+    if flick.tracking {
+        // Only real movement counts: frames redrawn under a still finger would dilute the speed.
+        let window = FLICK_WINDOW.max(frame_dt as f64 * 2.5);
+        if let Some(p) = pos
+            && flick.samples.last().is_none_or(|&(_, y)| y != p.y)
+        {
+            flick.samples.push((time, p.y));
+            flick.samples.retain(|&(t, _)| time - t <= 2.0 * window);
+        }
+        if released || !down {
+            flick.tracking = false;
+            let carried = std::mem::take(&mut flick.carried);
+            // A finger that stopped before lifting doesn't flick.
+            let last = flick.samples.last().copied().filter(|&(t, _)| time - t <= window);
+            let first =
+                last.and_then(|(t1, _)| flick.samples.iter().copied().find(|&(t, _)| t1 - t <= window));
+            if let (Some((t0, y0)), Some((t1, y1))) = (first, last)
+                && t1 > t0
+            {
+                // Offset grows as the finger moves up.
+                let speed = -(y1 - y0) / (t1 - t0) as f32;
+                if speed.abs() >= FLICK_MIN_SPEED {
+                    let stacked = if speed.signum() == carried.signum() { carried } else { 0.0 };
+                    flick.vel = (speed + stacked).clamp(-FLICK_MAX_SPEED, FLICK_MAX_SPEED);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(id, flick));
+    output.inner
 }

@@ -54,7 +54,7 @@ impl ThemeKind {
                 dark: true,
             },
             ThemeKind::Night => Palette {
-                bg: hex("#0F0F10"),
+                bg: hex("#000000"),
                 text: hex("#B8B2A7"),
                 muted: hex("#6E6A64"),
                 faint: hex("#252527"),
@@ -176,6 +176,13 @@ impl Spacing {
     }
 }
 
+/// How the library lays out the shelf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShelfView {
+    List,
+    Covers,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Measure {
     Narrow,
@@ -217,6 +224,7 @@ pub struct Settings {
     pub indent: bool,
     pub show_progress: bool,
     pub animate: bool,
+    pub shelf: ShelfView,
 }
 
 impl Default for Settings {
@@ -232,6 +240,7 @@ impl Default for Settings {
             indent: true,
             show_progress: true,
             animate: true,
+            shelf: ShelfView::List,
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::book::Book;
 use crate::fonts;
 use crate::layout::{self, ChapterLayout, Content, Params, Shaper};
 use crate::theme::{Measure, Palette, Settings, Spacing, ThemeKind, Typeface};
+use crate::viewer::Viewer;
 use crate::widgets::{self, Icon, lerp_color};
 
 /// Offset meaning "the last page of the chapter", resolved once the chapter is laid out.
@@ -51,6 +52,9 @@ pub struct Reader {
     pending: Option<(Params, f64)>,
     shaper: Shaper,
     images: HashMap<String, ImageSlot>,
+    /// Where each illustration on the page at rest was drawn, last frame: taps there open it.
+    page_images: Vec<(Rect, String)>,
+    viewer: Option<Viewer>,
     chrome: bool,
     sheet: Sheet,
     slide: Option<Slide>,
@@ -82,6 +86,8 @@ impl Reader {
             pending: None,
             shaper: Shaper::new(Typeface::Literata),
             images: HashMap::new(),
+            page_images: Vec::new(),
+            viewer: None,
             chrome: false,
             sheet: Sheet::None,
             slide: None,
@@ -124,11 +130,16 @@ impl Reader {
         }
 
         let column = Rect::from_min_size(
-            pos2((screen.center().x - params.width * 0.5).round(), screen.top() + top_margin(screen)),
+            pos2(
+                (screen.center().x - params.width * 0.5).round(),
+                screen.top() + column_top(screen, &params),
+            ),
             vec2(params.width, params.height),
         );
 
-        self.handle_input(ui, &ctx, hyph, settings, screen, now);
+        if self.viewer.is_none() {
+            self.handle_input(ui, &ctx, hyph, settings, screen, now);
+        }
 
         // Pages, sliding if a turn is under way.
         let offset = self.visual_offset(now);
@@ -152,17 +163,13 @@ impl Reader {
             None
         };
         let painter = ui.painter().clone();
-        self.paint_page(&painter, &ctx, self.chapter, page, column.min + vec2(offset, 0.0), &pal, fade);
+        self.page_images.clear();
+        let at_rest = offset.abs() < 0.5;
+        let origin = column.min + vec2(offset, 0.0);
+        self.paint_page(&painter, &ctx, self.chapter, page, origin, &pal, fade, at_rest);
         if let Some(((chapter, page), shift)) = neighbour {
-            self.paint_page(
-                &painter,
-                &ctx,
-                chapter,
-                page,
-                column.min + vec2(offset + shift, 0.0),
-                &pal,
-                fade,
-            );
+            let origin = column.min + vec2(offset + shift, 0.0);
+            self.paint_page(&painter, &ctx, chapter, page, origin, &pal, fade, false);
         }
 
         let chrome_t = ctx.animate_bool_with_time(Id::unique("chrome"), self.chrome, 0.2);
@@ -179,9 +186,22 @@ impl Reader {
         }
         self.settings_sheet(&ctx, screen, settings, &pal);
         self.contents_sheet(&ctx, screen, &pal);
+        if let Some(viewer) = &mut self.viewer {
+            let open = match self.images.get(viewer.key()) {
+                Some(ImageSlot::Ready(texture)) => viewer.ui(&ctx, screen, texture, &pal, now),
+                _ => false,
+            };
+            if !open {
+                self.viewer = None;
+            }
+        }
 
         // Hide the pointer while reading undisturbed.
-        if !self.chrome && self.sheet == Sheet::None && now - self.pointer_moved > 2.5 {
+        if !self.chrome
+            && self.sheet == Sheet::None
+            && self.viewer.is_none()
+            && now - self.pointer_moved > 2.5
+        {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         } else if !self.chrome {
             ctx.request_repaint_after_secs(2.6);
@@ -387,10 +407,15 @@ impl Reader {
                 }
             }
             if surface.clicked() {
-                if self.chrome {
+                let pos = surface.interact_pointer_pos();
+                let x = pos.map_or(0.5, |p| (p.x - screen.left()) / width);
+                // Taps on an illustration (away from the page-turning edges) take a closer look.
+                let image = pos.and_then(|p| self.page_images.iter().find(|(r, _)| r.contains(p)));
+                if let (false, Some((rect, key))) = (self.chrome || !(0.28..=0.72).contains(&x), image) {
+                    self.viewer = Some(Viewer::new(key.clone(), *rect, now));
+                } else if self.chrome {
                     self.chrome = false;
-                } else if let Some(pos) = surface.interact_pointer_pos() {
-                    let x = (pos.x - screen.left()) / width;
+                } else if pos.is_some() {
                     if x < 0.28 {
                         self.turn(ctx, hyph, -1, width, animate, now);
                     } else if x > 0.72 {
@@ -462,6 +487,16 @@ impl Reader {
                                 self.chrome = !self.chrome;
                             }
                         }
+                        // Android's back gesture: peel away one layer at a time, then leave the book.
+                        Key::BrowserBack => {
+                            if self.sheet != Sheet::None {
+                                self.sheet = Sheet::None;
+                            } else if self.chrome {
+                                self.chrome = false;
+                            } else {
+                                self.close = true;
+                            }
+                        }
                         Key::Enter | Key::M => self.chrome = !self.chrome,
                         Key::T => self.toggle_sheet(Sheet::Contents),
                         Key::S => self.toggle_sheet(Sheet::Settings),
@@ -501,6 +536,7 @@ impl Reader {
         origin: Pos2,
         pal: &Palette,
         alpha: f32,
+        record: bool,
     ) {
         let Some(layout) = self.layouts.get(&chapter) else { return };
         let Some(page) = layout.pages.get(page) else { return };
@@ -528,6 +564,9 @@ impl Reader {
                     }
                     let ImageSlot::Ready(texture) = slot else { continue };
                     let rect = Rect::from_min_size(widgets::snap(ctx, pos2(origin.x + x, y)), *size);
+                    if record {
+                        self.page_images.push((rect, key.clone()));
+                    }
                     let tint = if pal.dark { Color32::from_gray(205) } else { Color32::WHITE };
                     painter.image(
                         texture.id(),
@@ -549,8 +588,9 @@ impl Reader {
     }
 
     /// Pages remaining before the next table-of-contents entry (or the chapter's end).
-    fn pages_left_in_section(&self) -> usize {
-        let layout = &self.layouts[&self.chapter];
+    /// `None` just after a jump, until the new chapter has been laid out.
+    fn pages_left_in_section(&self) -> Option<usize> {
+        let layout = self.layouts.get(&self.chapter)?;
         let page = layout.page_at(self.offset);
         let here = (self.chapter, layout.pages[page].offset);
         let next = self.book.toc.iter().find(|e| (e.chapter, e.offset) > here && e.chapter == self.chapter);
@@ -561,7 +601,7 @@ impl Reader {
             }
             None => layout.pages.len() - 1,
         };
-        last.saturating_sub(page)
+        Some(last.saturating_sub(page))
     }
 
     fn section_title(&self) -> Option<&str> {
@@ -572,7 +612,7 @@ impl Reader {
         if alpha <= 0.0 {
             return;
         }
-        let y = column.bottom() + (screen.bottom() - column.bottom()) * 0.5;
+        let y = column.bottom() + (top_margin(screen) + 10.0) * 0.5;
         let color = pal.muted.gamma_multiply(0.75 * alpha);
         let font = fonts::ui(11.5);
         let pct = format!("{}%", (self.progress() * 100.0).round());
@@ -608,31 +648,22 @@ impl Reader {
                 {
                     self.close = true;
                 }
-                let right = bar.right();
-                if widgets::icon_button(
-                    ui,
-                    button(right - 30.0),
-                    Id::unique("fullscreen"),
-                    Icon::Fullscreen,
-                    pal,
-                )
-                .clicked()
-                {
-                    toggle_fullscreen(ctx);
+                // Phones are always fullscreen, so there the button would do nothing.
+                let fullscreen = !cfg!(target_os = "android");
+                let mut x = bar.right() - 30.0;
+                if fullscreen {
+                    if widgets::icon_button(ui, button(x), Id::unique("fullscreen"), Icon::Fullscreen, pal)
+                        .clicked()
+                    {
+                        toggle_fullscreen(ctx);
+                    }
+                    x -= 44.0;
                 }
-                if widgets::icon_button(ui, button(right - 74.0), Id::unique("type"), Icon::Type, pal)
-                    .clicked()
-                {
+                if widgets::icon_button(ui, button(x), Id::unique("type"), Icon::Type, pal).clicked() {
                     self.toggle_sheet(Sheet::Settings);
                 }
-                if widgets::icon_button(
-                    ui,
-                    button(right - 118.0),
-                    Id::unique("contents"),
-                    Icon::Contents,
-                    pal,
-                )
-                .clicked()
+                x -= 44.0;
+                if widgets::icon_button(ui, button(x), Id::unique("contents"), Icon::Contents, pal).clicked()
                 {
                     self.toggle_sheet(Sheet::Contents);
                 }
@@ -719,11 +750,11 @@ impl Reader {
                     );
                 }
                 let small = fonts::ui(12.0);
-                let left = self.pages_left_in_section();
-                let pages_text = match left {
-                    0 => "Last page in chapter".to_owned(),
-                    1 => "1 page left in chapter".to_owned(),
-                    n => format!("{n} pages left in chapter"),
+                let pages_text = match self.pages_left_in_section() {
+                    Some(0) => "Last page in chapter".to_owned(),
+                    Some(1) => "1 page left in chapter".to_owned(),
+                    Some(n) => format!("{n} pages left in chapter"),
+                    None => String::new(),
                 };
                 let painter = ui.painter();
                 painter.text(
@@ -846,7 +877,8 @@ impl Reader {
                         );
                         ui.add_space(6.0);
 
-                        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        let area = egui::ScrollArea::vertical().auto_shrink(false);
+                        widgets::flick_scroll(ui, Id::unique("contents-scroll"), area, |ui| {
                             for (i, entry) in self.book.toc.iter().enumerate() {
                                 let is_current = current == Some(i);
                                 let indent = 12.0 + entry.depth as f32 * 16.0;
@@ -866,7 +898,7 @@ impl Reader {
                                     Sense::click(),
                                 );
                                 let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if response.hovered() {
+                                if widgets::hovering(ui, &response) {
                                     ui.painter().rect_filled(
                                         rect,
                                         CornerRadius::same(8),
@@ -984,7 +1016,7 @@ fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette) {
         if response.clicked() {
             settings.size = (settings.size + delta).clamp(Settings::MIN_SIZE, Settings::MAX_SIZE);
         }
-        let color = if response.hovered() { pal.text } else { pal.muted };
+        let color = if widgets::hovering(ui, &response) { pal.text } else { pal.muted };
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, "A", fonts::serif(size, false), color);
     }
     ui.painter().text(
@@ -1027,12 +1059,26 @@ fn top_margin(screen: Rect) -> f32 {
     (screen.height() * 0.075).clamp(34.0, 80.0).round()
 }
 
+/// The tallest a page may be, relative to its width. Roughly a printed book's text block, so a
+/// tall portrait screen shows a page rather than a scroll.
+const PAGE_RATIO: f32 = 1.6;
+
+/// Where the text column starts: below the top margin, or lower so that a page shorter than
+/// the screen sits in the middle of it.
+fn column_top(screen: Rect, params: &Params) -> f32 {
+    ((screen.height() - params.height - 10.0) * 0.5).max(top_margin(screen)).round()
+}
+
 fn target_params(screen: Rect, s: &Settings) -> Params {
     let side = (screen.width() * 0.07).clamp(20.0, 120.0);
-    let width = (s.size * s.measure.ems()).min(screen.width() - 2.0 * side).max(160.0).floor();
+    let measure = s.size * s.measure.ems();
+    let width = measure.min(screen.width() - 2.0 * side).max(160.0).floor();
     let top = top_margin(screen);
     let bottom = top + 10.0;
-    let height = (screen.height() - top - bottom).max(120.0).floor();
+    // On a phone the screen already is the page; only shape it when the line length, not the
+    // screen, decided the width.
+    let max_height = if measure < screen.width() - 2.0 * side { width * PAGE_RATIO } else { f32::INFINITY };
+    let height = (screen.height() - top - bottom).min(max_height).max(120.0).floor();
     Params {
         width,
         height,
