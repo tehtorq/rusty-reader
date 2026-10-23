@@ -232,6 +232,11 @@ fn installed_voices(dir: &Path) -> Vec<(VoiceInfo, PathBuf)> {
                 id: stem.clone(),
                 language: locale.replace('_', "-"),
                 name: format!("{label} ({region})"),
+                download_mb: 0,
+                removable: false,
+                group: String::new(),
+                shared: false,
+                engine: String::new(),
             };
             Some((info, model))
         })

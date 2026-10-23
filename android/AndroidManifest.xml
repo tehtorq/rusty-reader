@@ -58,6 +58,15 @@
             </intent-filter>
         </activity>
 
+        <!-- Relaunches the app in a fresh process when Android reuses an old one (see the class). -->
+        <activity
+            android:name="com.rustyreader.RestartActivity"
+            android:process=":restart"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name="com.rustyreader.NarrationService"
             android:exported="false"

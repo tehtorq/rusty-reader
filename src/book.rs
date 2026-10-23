@@ -60,6 +60,8 @@ pub struct Block {
     pub list: u8,
     /// The publisher asked for no first-line indent.
     pub no_indent: bool,
+    /// The publisher left a wide gap above: a break between scenes.
+    pub break_before: bool,
 }
 
 impl Block {
@@ -296,6 +298,7 @@ impl Book {
             }
         }
         toc.sort_by_key(|e| (e.chapter, e.offset));
+        join_numbers(&mut toc);
 
         let mut images = HashMap::new();
         image_paths.sort();
@@ -376,6 +379,8 @@ struct Builder<'a> {
     plain_text: bool,
     pending_ids: Vec<String>,
     pending_marker: Option<String>,
+    /// The next block opens a new scene (see `Block::break_before`).
+    pending_break: bool,
     anchors: HashMap<String, usize>,
 }
 
@@ -425,6 +430,7 @@ impl<'a> Builder<'a> {
             plain_text: false,
             pending_ids: Vec::new(),
             pending_marker: None,
+            pending_break: false,
             anchors: HashMap::new(),
         }
     }
@@ -512,6 +518,7 @@ impl<'a> Builder<'a> {
                 _ => ctx.align,
             });
             c.no_indent = props.no_indent.unwrap_or(false);
+            self.pending_break |= props.break_before.unwrap_or(false);
             match name {
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     c.kind = BlockKind::Heading(name.as_bytes()[1] - b'0');
@@ -649,6 +656,7 @@ impl<'a> Builder<'a> {
             quote: ctx.quote,
             list: ctx.list,
             no_indent: ctx.no_indent,
+            break_before: std::mem::take(&mut self.pending_break),
         });
     }
 }
@@ -712,6 +720,7 @@ struct Props {
     small_caps: Option<bool>,
     align: Option<Align>,
     no_indent: Option<bool>,
+    break_before: Option<bool>,
     hidden: bool,
 }
 
@@ -722,6 +731,7 @@ impl Props {
         self.small_caps = other.small_caps.or(self.small_caps);
         self.align = other.align.or(self.align);
         self.no_indent = other.no_indent.or(self.no_indent);
+        self.break_before = other.break_before.or(self.break_before);
         self.hidden |= other.hidden;
     }
 
@@ -752,12 +762,25 @@ impl Props {
                         value.trim_start_matches(['0', '.']).chars().all(|c| c.is_alphabetic() || c == '%');
                     props.no_indent = Some(zero);
                 }
+                "margin-top" | "padding-top" => props.break_before = Some(wide_gap(&value)),
+                "margin" | "padding" => {
+                    props.break_before = value.split_whitespace().next().map(wide_gap);
+                }
                 "display" if value == "none" => props.hidden = true,
                 _ => {}
             }
         }
         props
     }
+}
+
+/// Whether a top margin is wide enough to mark a scene break, rather than ordinary spacing:
+/// a line and a half or more.
+fn wide_gap(value: &str) -> bool {
+    let number = |unit: &str| value.strip_suffix(unit).and_then(|n| n.trim().parse::<f32>().ok());
+    let ems = number("rem").or_else(|| number("em")).or_else(|| number("px").map(|px| px / 16.0));
+    let ems = ems.or_else(|| number("pt").map(|pt| pt / 12.0));
+    ems.is_some_and(|em| em >= 1.5)
 }
 
 #[derive(Default, Clone)]
@@ -819,6 +842,7 @@ impl Css {
             props.merge(p);
             // A blanket `p { text-indent: 0 }` is a house style; the reader's preference wins.
             props.no_indent = None;
+            props.break_before = None;
         }
         for class in classes {
             if let Some(p) = self.rules.get(&format!(".{class}")) {
@@ -910,6 +934,39 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Some books list a chapter's number and its name as two entries ("13", then "An Offer and a
+/// Departure"): make them one, "13 An Offer and a Departure", where the number is.
+fn join_numbers(toc: &mut Vec<TocEntry>) {
+    let mut i = 0;
+    while i + 1 < toc.len() {
+        let (number, name) = (&toc[i], &toc[i + 1]);
+        if is_number(&number.label)
+            && !is_number(&name.label)
+            && name.chapter == number.chapter
+            && name.depth == number.depth
+        {
+            let name = toc.remove(i + 1);
+            toc[i].label = format!("{} {}", toc[i].label, name.label);
+        }
+        i += 1;
+    }
+}
+
+/// "13", "XIII", "Chapter 13", "Part Two"… a label that only numbers its section.
+fn is_number(label: &str) -> bool {
+    const WORDS: &str = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen \
+                         fifteen sixteen seventeen eighteen nineteen twenty";
+    let label = label.trim_end_matches(['.', ':']);
+    let lower = label.to_lowercase();
+    let prefix = ["chapter ", "part ", "book "].iter().find(|p| lower.starts_with(*p)).map_or(0, |p| p.len());
+    let (rest, lower_rest) = (&label[prefix..], &lower[prefix..]);
+    !rest.is_empty()
+        && (rest.chars().all(|c| c.is_ascii_digit())
+            // Capitals only, so a name like "Mix" isn't taken for a numeral.
+            || rest.chars().all(|c| "IVXLCDM".contains(c))
+            || (prefix > 0 && WORDS.split(' ').any(|w| w == lower_rest)))
+}
+
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -928,10 +985,60 @@ mod tests {
     }
 
     #[test]
+    fn joins_numbers_to_their_names() {
+        let entry = |label: &str, chapter| TocEntry { label: label.into(), chapter, offset: 0, depth: 0 };
+        let mut toc = vec![
+            entry("Prologue", 0),
+            entry("13", 1),
+            entry("An Offer and a Departure", 1),
+            entry("XIV", 2),
+            entry("A Box Opens", 3),
+            entry("Chapter Two", 4),
+            entry("Mixed", 4),
+            entry("Mix", 5),
+            entry("Up", 5),
+            entry("1", 5),
+            entry("2", 5),
+        ];
+        join_numbers(&mut toc);
+        let labels: Vec<&str> = toc.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Prologue",
+                "13 An Offer and a Departure",
+                "XIV",
+                "A Box Opens",
+                "Chapter Two Mixed",
+                "Mix",
+                "Up",
+                "1",
+                "2"
+            ]
+        );
+    }
+
+    #[test]
     fn resolves_relative_paths() {
         assert_eq!(resolve("OEBPS/Text", "../Images/a%20b.jpg#x"), "OEBPS/Images/a b.jpg");
         assert_eq!(resolve("", "./cover.jpg"), "cover.jpg");
         assert_eq!(resolve("OEBPS", "/root.css"), "root.css");
+    }
+
+    #[test]
+    fn wide_top_margins_break_scenes() {
+        let css = Css::parse(
+            "p { margin-top: 3em } .para2 { margin-top: 2.5em } .near { margin: 0.5em 0 } .gap { margin: 24px 0 }",
+        );
+        let html = Html::parse_document(
+            r#"<body><p>a</p><p class="para2">b</p><p class="near">c</p><div class="gap"><p>d</p><p>e</p></div></body>"#,
+        );
+        let mut builder = Builder::new(&css, String::new());
+        builder.walk(*select(&html, "body").next().unwrap(), &Ctx::default());
+        builder.flush(&Ctx::default());
+        let breaks: Vec<bool> = builder.blocks.iter().map(|b| b.break_before).collect();
+        // A blanket `p` margin is house style, not a scene break.
+        assert_eq!(breaks, [false, true, false, true, false]);
     }
 
     #[test]

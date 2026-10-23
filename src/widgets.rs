@@ -26,6 +26,12 @@ pub enum Icon {
     Previous,
     Next,
     More,
+    Check,
+    Download,
+    Delete,
+    Forward,
+    Cog,
+    Voice,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -121,6 +127,67 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 let bar = Rect::from_center_size(at(x, 0.5), vec2(rect.width() * 0.07, rect.height() * 0.32));
                 painter.rect_filled(bar, CornerRadius::same(1), color);
             }
+        }
+        Icon::Check => {
+            painter.add(Shape::line(vec![at(0.32, 0.52), at(0.45, 0.65), at(0.7, 0.37)], stroke));
+        }
+        Icon::Download => {
+            painter.line_segment([at(0.5, 0.3), at(0.5, 0.6)], stroke);
+            painter.add(Shape::line(vec![at(0.38, 0.49), at(0.5, 0.61), at(0.62, 0.49)], stroke));
+            painter.line_segment([at(0.33, 0.7), at(0.67, 0.7)], stroke);
+        }
+        Icon::Delete => {
+            // A bin: lid, handle and body.
+            painter.line_segment([at(0.32, 0.35), at(0.68, 0.35)], stroke);
+            painter.add(Shape::line(
+                vec![at(0.44, 0.35), at(0.44, 0.29), at(0.56, 0.29), at(0.56, 0.35)],
+                stroke,
+            ));
+            painter
+                .add(Shape::line(vec![at(0.37, 0.35), at(0.4, 0.71), at(0.6, 0.71), at(0.63, 0.35)], stroke));
+        }
+        Icon::Cog => {
+            // Eight teeth around a ring.
+            let center = at(0.5, 0.5);
+            let r = rect.width();
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let dir = vec2(a.cos(), a.sin());
+                painter.line_segment(
+                    [center + dir * r * 0.17, center + dir * r * 0.27],
+                    Stroke::new(2.4, color),
+                );
+            }
+            painter.circle_stroke(center, r * 0.17, stroke);
+            painter.circle_filled(center, r * 0.06, color);
+        }
+        Icon::Voice => {
+            // A speaker, and the sound coming from it.
+            painter.add(Shape::convex_polygon(
+                vec![
+                    at(0.26, 0.42),
+                    at(0.36, 0.42),
+                    at(0.48, 0.3),
+                    at(0.48, 0.7),
+                    at(0.36, 0.58),
+                    at(0.26, 0.58),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            for (radius, spread) in [(0.12, 0.8), (0.22, 0.75)] {
+                let center = at(0.48, 0.5);
+                let points = (0..=12)
+                    .map(|k| {
+                        let a = -spread + 2.0 * spread * k as f32 / 12.0;
+                        center + vec2(a.cos(), a.sin()) * rect.width() * radius
+                    })
+                    .collect();
+                painter.add(Shape::line(points, stroke));
+            }
+        }
+        Icon::Forward => {
+            painter.add(Shape::line(vec![at(0.44, 0.3), at(0.62, 0.5), at(0.44, 0.7)], stroke));
         }
     }
 }
@@ -256,6 +323,28 @@ pub fn stepper(ui: &mut Ui, id: Id, label: &str, pal: &Palette) -> Option<i32> {
     let galley = elided(ui, label, fonts::ui(14.0), pal.text, row.width() - 100.0);
     ui.painter().galley(row.center() - galley.size() * 0.5, galley, pal.text);
     step
+}
+
+/// A row showing what is chosen now (with a line of detail, if any), and an icon saying
+/// that pressing it opens the choices.
+pub fn choice(ui: &mut Ui, id: Id, label: &str, detail: &str, icon: Icon, pal: &Palette) -> Response {
+    let height = if detail.is_empty() { 44.0 } else { 54.0 };
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let response = ui.interact(row, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), hovering(&*ui, &response), 0.12);
+    ui.painter().rect_filled(row, CornerRadius::same(10), pal.faint.gamma_multiply(0.6 + 0.4 * hover));
+    let width = row.width() - 64.0;
+    let name = elided(ui, label, fonts::ui(15.0), pal.text, width);
+    if detail.is_empty() {
+        ui.painter().galley(pos2(row.left() + 14.0, row.center().y - name.size().y * 0.5), name, pal.text);
+    } else {
+        ui.painter().galley(pos2(row.left() + 14.0, row.top() + 9.0), name, pal.text);
+        let detail = elided(ui, detail, fonts::ui(12.0), pal.muted, width);
+        ui.painter().galley(pos2(row.left() + 14.0, row.bottom() - 9.0 - detail.size().y), detail, pal.muted);
+    }
+    let at = Rect::from_center_size(pos2(row.right() - 24.0, row.center().y), vec2(36.0, 36.0));
+    paint_icon(ui.painter(), at, icon, lerp_color(pal.muted, pal.text, hover));
+    response
 }
 
 /// A pill-shaped text button.

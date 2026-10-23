@@ -815,7 +815,7 @@ fn block_fmt(block: &Block, prev: Option<&Block>, p: &Params) -> BlockFmt {
 fn space_between(prev: &Block, cur: &Block, p: &Params) -> f32 {
     use BlockKind::*;
     let l = p.leading();
-    match (&prev.kind, &cur.kind) {
+    let gap = match (&prev.kind, &cur.kind) {
         (Heading(_), Heading(_)) => l * 0.35,
         (_, Heading(_)) => l * 1.6,
         (Heading(_), _) => l * 1.0,
@@ -832,7 +832,9 @@ fn space_between(prev: &Block, cur: &Block, p: &Params) -> f32 {
             if !p.indent || cur.no_indent && !centred { l * 0.6 } else { 0.0 }
         }
         _ => 0.0,
-    }
+    };
+    // A scene break: a blank line, as the book has it.
+    if cur.break_before { gap.max(l * 1.5) } else { gap }
 }
 
 pub fn layout_chapter(

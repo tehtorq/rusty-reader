@@ -16,7 +16,7 @@ use crate::fonts;
 use crate::layout::{self, ChapterLayout, Content, Params, Shaper};
 use crate::picture::Picture;
 use crate::platform;
-use crate::speech::{self, Control, Narrator, Spot, State, Status, VoicePrefs};
+use crate::speech::{self, Control, Narrator, Spot, State, Status, VoiceInfo, VoicePrefs};
 use crate::theme::{Measure, Palette, Settings, Spacing, ThemeKind, Typeface};
 use crate::viewer::Viewer;
 use crate::widgets::{self, Icon, lerp_color};
@@ -29,6 +29,18 @@ enum Sheet {
     None,
     Settings,
     Contents,
+    /// Reading aloud: speed and voice.
+    Listening,
+    Voices,
+}
+
+/// Something to do with a voice, chosen in the list of voices.
+enum VoiceAction {
+    /// A voice, and its engine.
+    Choose(String, String),
+    Engine(String),
+    Download(String),
+    Remove(String),
 }
 
 /// Illustrations are decoded on a background thread the first time they're needed.
@@ -76,6 +88,10 @@ pub struct Reader {
     download_failed: Option<f64>,
     /// The last reading-aloud error shown, and since when.
     error_shown: Option<(u32, f64)>,
+    /// The narrator has been asked for its voices, for the settings.
+    voices_asked: bool,
+    /// A voice whose delete button was pressed once: pressing again deletes it.
+    confirm_remove: Option<String>,
     chrome: bool,
     sheet: Sheet,
     slide: Option<Slide>,
@@ -118,6 +134,8 @@ impl Reader {
             listening: State::Idle,
             download_failed: None,
             error_shown: None,
+            voices_asked: false,
+            confirm_remove: None,
             chrome: false,
             sheet: Sheet::None,
             slide: None,
@@ -281,7 +299,32 @@ impl Reader {
                 self.bottom_bar(&ctx, screen, &pal, bottom_t);
             }
         }
-        self.settings_sheet(&ctx, screen, settings, &pal, &status);
+        if matches!(self.sheet, Sheet::Listening | Sheet::Voices) && !self.voices_asked {
+            // Start the voice engine, so the settings can offer its voices before any reading.
+            self.voices_asked = true;
+            let language = self.book.language.clone().unwrap_or_else(|| "en".into());
+            narrator.prepare(&ctx, &language, voice_prefs(settings));
+        }
+        self.settings_sheet(&ctx, screen, settings, &pal);
+        self.listening_sheet(&ctx, screen, settings, &pal, &status);
+        match self.voices_sheet(&ctx, screen, settings, &pal, &status) {
+            Some(VoiceAction::Choose(voice, engine)) => {
+                settings.speech_voice = Some(voice);
+                settings.voice_engine = (!engine.is_empty()).then_some(engine);
+            }
+            Some(VoiceAction::Engine(engine)) => {
+                settings.voice_engine = Some(engine);
+                settings.speech_voice = None;
+            }
+            Some(VoiceAction::Download(voice)) => narrator.download(&voice),
+            Some(VoiceAction::Remove(voice)) => {
+                if settings.speech_voice.as_ref() == Some(&voice) {
+                    settings.speech_voice = None;
+                }
+                narrator.remove(&voice);
+            }
+            None => {}
+        }
         self.contents_sheet(&ctx, screen, &pal);
         self.listen(&ctx, hyph, settings, narrator, &status, before, speech_before, screen.width(), now);
         if let Some(viewer) = &mut self.viewer {
@@ -874,21 +917,32 @@ impl Reader {
         }
     }
 
-    /// Pages remaining before the next table-of-contents entry (or the chapter's end).
+    /// Which page of the current chapter this is, and how many it has: (1-based page, pages).
+    /// A chapter runs from one table-of-contents entry to the next, within the book's file.
     /// `None` just after a jump, until the new chapter has been laid out.
-    fn pages_left_in_section(&self) -> Option<usize> {
+    fn chapter_pages(&self) -> Option<(usize, usize)> {
         let layout = self.layouts.get(&self.chapter)?;
         let page = layout.page_at(self.offset);
         let here = (self.chapter, layout.pages[page].offset);
-        let next = self.book.toc.iter().find(|e| (e.chapter, e.offset) > here && e.chapter == self.chapter);
-        let last = match next {
+        let in_file = |e: &&crate::book::TocEntry| e.chapter == self.chapter;
+        let first = match self.book.toc.iter().filter(in_file).rfind(|e| (e.chapter, e.offset) <= here) {
+            Some(entry) => layout.page_at(entry.offset),
+            None => 0,
+        };
+        let last = match self.book.toc.iter().filter(in_file).find(|e| (e.chapter, e.offset) > here) {
             Some(entry) => {
                 let starts = layout.page_at(entry.offset);
                 if layout.pages[starts].offset == entry.offset { starts.saturating_sub(1) } else { starts }
             }
             None => layout.pages.len() - 1,
         };
-        Some(last.saturating_sub(page))
+        let first = first.min(page);
+        let last = last.max(page);
+        Some((page - first + 1, last - first + 1))
+    }
+
+    fn pages_left_in_section(&self) -> Option<usize> {
+        self.chapter_pages().map(|(page, pages)| pages - page)
     }
 
     fn section_title(&self) -> Option<&str> {
@@ -899,19 +953,16 @@ impl Reader {
         if alpha <= 0.0 {
             return;
         }
+        // The chapter's title, and where you are in it: "1/23".
+        let Some((page, pages)) = self.chapter_pages() else { return };
         let y = column.bottom() + (top_margin(screen) + 10.0) * 0.5;
         let color = pal.muted.gamma_multiply(0.75 * alpha);
         let font = fonts::ui(11.5);
-        let pct = format!("{}%", (self.progress() * 100.0).round());
-        let pct_galley = widgets::tracked(ui, &pct, font.clone(), color, 0.4);
+        let count = widgets::tracked(ui, &format!("{page}/{pages}"), font.clone(), color, 0.4);
         let painter = ui.painter();
-        painter.galley(
-            pos2(column.right() - pct_galley.size().x, y - pct_galley.size().y * 0.5),
-            pct_galley.clone(),
-            color,
-        );
+        painter.galley(pos2(column.right() - count.size().x, y - count.size().y * 0.5), count.clone(), color);
         if let Some(title) = self.section_title() {
-            let galley = widgets::elided(ui, title, font, color, column.width() - pct_galley.size().x - 32.0);
+            let galley = widgets::elided(ui, title, font, color, column.width() - count.size().x - 32.0);
             painter.galley(pos2(column.left(), y - galley.size().y * 0.5), galley, color);
         }
     }
@@ -1074,7 +1125,11 @@ impl Reader {
                     State::Paused => Icon::Play,
                     State::Idle => Icon::Listen,
                 };
-                let mut actions = vec![(Id::unique("listen"), listen), (Id::unique("type"), Icon::Type)];
+                let mut actions = vec![
+                    (Id::unique("listen"), listen),
+                    (Id::unique("voice-settings"), Icon::Voice),
+                    (Id::unique("type"), Icon::Type),
+                ];
                 // Phones are always fullscreen, so there the button would do nothing.
                 if !cfg!(target_os = "android") {
                     actions.push((Id::unique("fullscreen"), Icon::Fullscreen));
@@ -1088,6 +1143,7 @@ impl Reader {
                     {
                         match icon {
                             Icon::Type => self.toggle_sheet(Sheet::Settings),
+                            Icon::Voice => self.toggle_sheet(Sheet::Listening),
                             Icon::Fullscreen => toggle_fullscreen(ctx),
                             _ => self.listen_toggle = true,
                         }
@@ -1096,14 +1152,7 @@ impl Reader {
             });
     }
 
-    fn settings_sheet(
-        &mut self,
-        ctx: &egui::Context,
-        screen: Rect,
-        settings: &mut Settings,
-        pal: &Palette,
-        status: &Status,
-    ) {
+    fn settings_sheet(&mut self, ctx: &egui::Context, screen: Rect, settings: &mut Settings, pal: &Palette) {
         let t = ctx.animate_bool_with_time(Id::unique("settings-sheet"), self.sheet == Sheet::Settings, 0.22);
         if t <= 0.0 {
             return;
@@ -1117,17 +1166,404 @@ impl Reader {
                 ui.set_opacity(t);
                 sheet_frame(pal).show(ui, |ui| {
                     ui.set_width(width - 44.0);
-                    if screen.height() >= 780.0 {
-                        settings_contents(ui, settings, pal, status);
+                    if screen.height() >= 700.0 {
+                        settings_contents(ui, settings, pal);
                     } else {
                         let height = screen.height() - 90.0;
                         egui::ScrollArea::vertical()
                             .max_height(height)
                             .min_scrolled_height(height)
-                            .show(ui, |ui| settings_contents(ui, settings, pal, status));
+                            .show(ui, |ui| settings_contents(ui, settings, pal));
                     }
                 });
             });
+    }
+
+    /// Reading aloud: how fast, and in which voice (chosen from the list of voices).
+    fn listening_sheet(
+        &mut self,
+        ctx: &egui::Context,
+        screen: Rect,
+        settings: &mut Settings,
+        pal: &Palette,
+        status: &Status,
+    ) {
+        let t =
+            ctx.animate_bool_with_time(Id::unique("listening-sheet"), self.sheet == Sheet::Listening, 0.22);
+        if t <= 0.0 {
+            return;
+        }
+        let width = (screen.width() - 24.0).min(420.0);
+        egui::Area::new(Id::unique("listening-area"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -14.0 + (1.0 - ease_out(t)) * 40.0))
+            .interactable(t > 0.6)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                sheet_frame(pal).show(ui, |ui| {
+                    ui.set_width(width - 44.0);
+                    widgets::section_label(ui, "Speed", pal);
+                    const RATES: [f32; 5] = [0.8, 1.0, 1.2, 1.5, 2.0];
+                    let names = ["0.8×", "1×", "1.2×", "1.5×", "2×"];
+                    let selected = RATES
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| {
+                            (a.1 - settings.speech_rate).abs().total_cmp(&(b.1 - settings.speech_rate).abs())
+                        })
+                        .map_or(1, |(i, _)| i);
+                    if let Some(i) =
+                        widgets::segmented(ui, Id::unique("speech-rate"), &names, &[], selected, pal)
+                    {
+                        settings.speech_rate = RATES[i];
+                    }
+
+                    widgets::section_label(ui, "Voice", pal);
+                    let voice = current_voice(settings, status);
+                    let (name, detail) = match voice {
+                        Some(v) => {
+                            let detail = match &status.download {
+                                Some((id, f)) if id == &v.id && *f >= 0.0 => {
+                                    format!("Downloading… {:.0}%", f * 100.0)
+                                }
+                                _ if v.download_mb > 0 => format!("{} MB to download", v.download_mb),
+                                _ => v.group.clone(),
+                            };
+                            (v.name.clone(), detail)
+                        }
+                        None if status.voices.is_empty() => ("Finding voices…".to_owned(), String::new()),
+                        None => ("Choose a voice".to_owned(), String::new()),
+                    };
+                    if widgets::choice(ui, Id::unique("voice"), &name, &detail, Icon::Cog, pal).clicked() {
+                        self.sheet = Sheet::Voices;
+                    }
+                    ui.add_space(4.0);
+                });
+            });
+    }
+
+    /// Every voice there is: which is speaking, which are downloaded (and can be deleted
+    /// again) and which can be, how big they are, and how far a download has got.
+    fn voices_sheet(
+        &mut self,
+        ctx: &egui::Context,
+        screen: Rect,
+        settings: &Settings,
+        pal: &Palette,
+        status: &Status,
+    ) -> Option<VoiceAction> {
+        let t = ctx.animate_bool_with_time(Id::unique("voices-sheet"), self.sheet == Sheet::Voices, 0.22);
+        if t <= 0.0 {
+            self.confirm_remove = None;
+            return None;
+        }
+        let width = (screen.width() - 24.0).min(420.0);
+        let mut action = None;
+        egui::Area::new(Id::unique("voices-area"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -14.0 + (1.0 - ease_out(t)) * 40.0))
+            .interactable(t > 0.6)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                sheet_frame(pal).show(ui, |ui| {
+                    ui.set_width(width - 44.0);
+                    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
+                    let back =
+                        Rect::from_center_size(pos2(head.left() + 14.0, head.center().y), vec2(36.0, 36.0));
+                    if widgets::icon_button(ui, back, Id::unique("voices-back"), Icon::Back, pal).clicked() {
+                        self.sheet = Sheet::Listening;
+                    }
+                    ui.painter().text(
+                        pos2(head.left() + 40.0, head.center().y),
+                        Align2::LEFT_CENTER,
+                        "Voices",
+                        fonts::serif(22.0, false),
+                        pal.text,
+                    );
+                    let close =
+                        Rect::from_center_size(pos2(head.right() - 14.0, head.center().y), vec2(36.0, 36.0));
+                    if widgets::icon_button(ui, close, Id::unique("voices-close"), Icon::Close, pal).clicked()
+                    {
+                        self.sheet = Sheet::None;
+                    }
+                    ui.add_space(4.0);
+
+                    let height = (screen.height() * 0.62).min(560.0);
+                    let area = egui::ScrollArea::vertical()
+                        .max_height(height)
+                        .min_scrolled_height(height.min(320.0));
+                    area.show(ui, |ui| {
+                        if status.voices.is_empty() {
+                            ui.add_space(18.0);
+                            ui.label(
+                                egui::RichText::new("Finding voices…").font(fonts::ui(14.0)).color(pal.muted),
+                            );
+                            return;
+                        }
+                        let chosen = current_voice(settings, status).map(|v| v.id.clone());
+                        let mut start = 0;
+                        while start < status.voices.len() {
+                            let group = &status.voices[start].group;
+                            let end = status.voices[start..]
+                                .iter()
+                                .position(|v| &v.group != group)
+                                .map_or(status.voices.len(), |n| start + n);
+                            let voices = &status.voices[start..end];
+                            if let Some(act) = self.voice_group(ui, voices, status, pal) {
+                                action = Some(act);
+                            }
+                            for voice in voices {
+                                let is_chosen = chosen.as_ref() == Some(&voice.id);
+                                if let Some(act) = self.voice_row(ui, voice, is_chosen, status, pal) {
+                                    action = Some(act);
+                                }
+                            }
+                            start = end;
+                        }
+                        // The phone's other speech engines: choosing one lists its voices here.
+                        let in_use = status.voices.iter().map(|v| v.engine.as_str()).collect::<Vec<_>>();
+                        let others: Vec<_> =
+                            status.engines.iter().filter(|e| !in_use.contains(&e.id.as_str())).collect();
+                        if !others.is_empty() {
+                            widgets::section_label(ui, "Other speech engines", pal);
+                            for engine in others {
+                                let id = Id::unique(("engine-row", &engine.id));
+                                let (row, response) =
+                                    ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+                                if widgets::hovering(ui, &response) {
+                                    ui.painter().rect_filled(
+                                        row,
+                                        CornerRadius::same(10),
+                                        pal.faint.gamma_multiply(0.5),
+                                    );
+                                }
+                                let name = widgets::elided(
+                                    ui,
+                                    &engine.name,
+                                    fonts::ui(15.0),
+                                    pal.text,
+                                    row.width() - 60.0,
+                                );
+                                ui.painter().galley(
+                                    pos2(row.left() + 12.0, row.center().y - name.size().y * 0.5),
+                                    name,
+                                    pal.text,
+                                );
+                                let chevron = Rect::from_center_size(
+                                    pos2(row.right() - 20.0, row.center().y),
+                                    vec2(36.0, 36.0),
+                                );
+                                widgets::paint_icon(ui.painter(), chevron, Icon::Forward, pal.muted);
+                                if ui
+                                    .interact(row, id, Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    action = Some(VoiceAction::Engine(engine.id.clone()));
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+        action
+    }
+
+    /// A family of voices' heading. One that downloads as a whole (Kokoro) says so, and offers
+    /// to fetch or delete all of it at once.
+    fn voice_group(
+        &mut self,
+        ui: &mut Ui,
+        voices: &[VoiceInfo],
+        status: &Status,
+        pal: &Palette,
+    ) -> Option<VoiceAction> {
+        let first = &voices[0];
+        if first.group.is_empty() {
+            return None;
+        }
+        if !first.shared {
+            // Each downloads on its own, and says how big it is.
+            widgets::section_label(ui, &first.group, pal);
+            return None;
+        }
+        widgets::section_label(ui, &first.group, pal);
+        let count = voices.len();
+        let have = first.download_mb == 0;
+        let downloading =
+            status.download.as_ref().filter(|(id, _)| voices.iter().any(|v| &v.id == id)).map(|(_, f)| *f);
+        let id = Id::unique(("voice-group", &first.group));
+        let text = match downloading {
+            Some(f) if f >= 0.0 => format!("Downloading all {count} voices… {:.0}%", f * 100.0),
+            Some(_) => "Couldn't download. Try again?".to_owned(),
+            None if have => format!("All {count} voices are downloaded. They are deleted together, too."),
+            None => format!("All {count} voices come as one {} MB download.", first.download_mb),
+        };
+        let button_label = match downloading {
+            Some(f) if f >= 0.0 => None,
+            _ if !have => Some("Download all".to_owned()),
+            _ if self.confirm_remove.as_ref() == Some(&first.group) => Some(format!("Delete all {count}?")),
+            _ => Some("Delete all".to_owned()),
+        };
+        let label =
+            button_label.map(|label| ui.fonts_mut(|f| f.layout_no_wrap(label, fonts::ui(13.0), pal.accent)));
+        let button_width = label.as_ref().map_or(0.0, |g| g.size().x + 24.0);
+        let wrap = ui.available_width() - button_width - 32.0;
+        let text = ui.fonts_mut(|f| f.layout(text, fonts::ui(13.0), pal.muted, wrap));
+        let height = (text.size().y + 24.0).max(48.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+        ui.painter().rect_filled(row, CornerRadius::same(10), pal.faint.gamma_multiply(0.5));
+        ui.painter().galley(pos2(row.left() + 12.0, row.center().y - text.size().y * 0.5), text, pal.muted);
+        let button = label.map(|galley| {
+            let rect = Rect::from_center_size(
+                pos2(row.right() - 12.0 - button_width * 0.5, row.center().y),
+                vec2(button_width, 30.0),
+            );
+            (rect, galley)
+        });
+        if let Some(f) = downloading.filter(|f| *f >= 0.0) {
+            let track = Rect::from_min_max(
+                pos2(row.left() + 12.0, row.bottom() - 4.0),
+                pos2(row.right() - 12.0, row.bottom() - 2.0),
+            );
+            ui.painter().rect_filled(track, CornerRadius::same(1), pal.faint);
+            ui.painter().rect_filled(
+                track.with_max_x(track.left() + track.width() * f),
+                CornerRadius::same(1),
+                pal.accent,
+            );
+        }
+        let (rect, galley) = button?;
+        let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(15),
+            pal.accent.gamma_multiply(if widgets::hovering(ui, &response) { 0.22 } else { 0.13 }),
+        );
+        ui.painter().galley(rect.center() - galley.size() * 0.5, galley, pal.accent);
+        if !response.clicked() {
+            return None;
+        }
+        if !have {
+            return Some(VoiceAction::Download(first.id.clone()));
+        }
+        if self.confirm_remove.as_ref() == Some(&first.group) {
+            self.confirm_remove = None;
+            return Some(VoiceAction::Remove(first.id.clone()));
+        }
+        self.confirm_remove = Some(first.group.clone());
+        None
+    }
+
+    /// One voice in the list. Tapping a ready voice chooses it; tapping one that isn't
+    /// downloaded yet downloads it (unless its whole family downloads together: see above).
+    fn voice_row(
+        &mut self,
+        ui: &mut Ui,
+        voice: &VoiceInfo,
+        chosen: bool,
+        status: &Status,
+        pal: &Palette,
+    ) -> Option<VoiceAction> {
+        let id = Id::unique(("voice-row", &voice.id));
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::hover());
+        let downloading =
+            status.download.as_ref().filter(|(v, _)| v == &voice.id && !voice.shared).map(|(_, f)| *f);
+        let ready = voice.download_mb == 0;
+        let button = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(40.0, 40.0));
+        let tap = ui.interact(row.with_max_x(button.left()), id, Sense::click());
+        if widgets::hovering(ui, &tap) {
+            ui.painter().rect_filled(row, CornerRadius::same(10), pal.faint.gamma_multiply(0.5));
+        }
+        if chosen {
+            ui.painter().rect_filled(row, CornerRadius::same(10), pal.accent.gamma_multiply(0.1));
+        }
+
+        let name_color = if chosen {
+            pal.accent
+        } else if ready {
+            pal.text
+        } else {
+            pal.muted
+        };
+        let detail = match downloading {
+            Some(f) if f < 0.0 => "Couldn't download · tap to try again".to_owned(),
+            Some(f) => format!("Downloading… {:.0}%", f * 100.0),
+            None if !ready && voice.shared => format!("Comes with the {} download above", voice.group),
+            None if !ready => format!("{} MB to download", voice.download_mb),
+            None if chosen => "In use".to_owned(),
+            None if voice.removable && !voice.shared => "Downloaded".to_owned(),
+            None => String::new(),
+        };
+        let text_width = button.left() - row.left() - 20.0;
+        let name = widgets::elided(ui, &voice.name, fonts::ui(15.0), name_color, text_width);
+        let top = if detail.is_empty() { row.center().y - name.size().y * 0.5 } else { row.top() + 9.0 };
+        ui.painter().galley(pos2(row.left() + 12.0, top), name, name_color);
+        if !detail.is_empty() {
+            let detail = widgets::elided(ui, &detail, fonts::ui(12.0), pal.muted, text_width);
+            ui.painter().galley(
+                pos2(row.left() + 12.0, row.bottom() - 9.0 - detail.size().y),
+                detail,
+                pal.muted,
+            );
+        }
+        if let Some(f) = downloading.filter(|f| *f >= 0.0) {
+            let track = Rect::from_min_max(
+                pos2(row.left() + 12.0, row.bottom() - 3.0),
+                pos2(button.left() - 8.0, row.bottom() - 1.0),
+            );
+            ui.painter().rect_filled(track, CornerRadius::same(1), pal.faint);
+            ui.painter().rect_filled(
+                track.with_max_x(track.left() + track.width() * f),
+                CornerRadius::same(1),
+                pal.accent,
+            );
+        }
+
+        let mut action = None;
+        let tapped = tap.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+        if tapped && ready {
+            action = Some(VoiceAction::Choose(voice.id.clone(), voice.engine.clone()));
+            self.confirm_remove = None;
+        } else if tapped && !voice.shared && downloading.is_none_or(|f| f < 0.0) {
+            action = Some(VoiceAction::Download(voice.id.clone()));
+        }
+        if downloading.is_some_and(|f| f >= 0.0) || voice.shared {
+            // Nothing to press while it comes in; a shared download has its own buttons.
+            if chosen {
+                widgets::paint_icon(ui.painter(), button, Icon::Check, pal.accent);
+            }
+        } else if !ready {
+            if widgets::icon_button(ui, button, id.with("get"), Icon::Download, pal).clicked() {
+                action = Some(VoiceAction::Download(voice.id.clone()));
+            }
+        } else if voice.removable {
+            if self.confirm_remove.as_ref() == Some(&voice.id) {
+                // Asked once already: say what a second press does.
+                let sure = Rect::from_min_max(
+                    pos2(button.left() - 44.0, button.top() + 6.0),
+                    button.max - vec2(0.0, 6.0),
+                );
+                let response = ui.interact(sure, id.with("sure"), Sense::click());
+                ui.painter().rect_filled(sure, CornerRadius::same(14), pal.accent.gamma_multiply(0.15));
+                ui.painter().text(
+                    sure.center(),
+                    Align2::CENTER_CENTER,
+                    "Delete",
+                    fonts::ui(13.0),
+                    pal.accent,
+                );
+                if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.confirm_remove = None;
+                    action = Some(VoiceAction::Remove(voice.id.clone()));
+                }
+            } else if widgets::icon_button(ui, button, id.with("delete"), Icon::Delete, pal).clicked() {
+                self.confirm_remove = Some(voice.id.clone());
+            }
+        } else if chosen {
+            widgets::paint_icon(ui.painter(), button, Icon::Check, pal.accent);
+        }
+        action
     }
 
     fn contents_sheet(&mut self, ctx: &egui::Context, screen: Rect, pal: &Palette) {
@@ -1293,7 +1729,7 @@ fn sheet_frame(pal: &Palette) -> egui::Frame {
         .inner_margin(egui::Margin::same(22))
 }
 
-fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette, status: &Status) {
+fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette) {
     widgets::section_label(ui, "Theme", pal);
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 74.0), Sense::hover());
     let cell = row.width() / ThemeKind::ALL.len() as f32;
@@ -1382,58 +1818,19 @@ fn settings_contents(ui: &mut Ui, settings: &mut Settings, pal: &Palette, status
         pal,
     );
     widgets::toggle_row(ui, Id::unique("animate"), "Animate page turns", &mut settings.animate, pal);
+}
 
-    widgets::section_label(ui, "Reading aloud", pal);
-    const RATES: [f32; 5] = [0.8, 1.0, 1.2, 1.5, 2.0];
-    let names = ["0.8×", "1×", "1.2×", "1.5×", "2×"];
-    let selected = RATES
-        .iter()
-        .enumerate()
-        .min_by(|a, b| (a.1 - settings.speech_rate).abs().total_cmp(&(b.1 - settings.speech_rate).abs()))
-        .map_or(1, |(i, _)| i);
-    if let Some(i) = widgets::segmented(ui, Id::unique("speech-rate"), &names, &[], selected, pal) {
-        settings.speech_rate = RATES[i];
-    }
-    // On Android: the speech engine (Google's, the phone maker's, or another installed one).
-    let engines = &status.engines;
-    if engines.len() > 1 {
-        ui.add_space(8.0);
-        let current =
-            settings.voice_engine.as_ref().and_then(|e| engines.iter().position(|x| &x.id == e)).unwrap_or(0);
-        if let Some(step) = widgets::stepper(ui, Id::unique("engine"), &engines[current].name, pal) {
-            let next = (current as i32 + step).rem_euclid(engines.len() as i32) as usize;
-            settings.voice_engine = Some(engines[next].id.clone());
-            // Voices belong to their engine.
-            settings.speech_voice = None;
-        }
-    }
-    let voices = &status.voices;
-    if voices.len() > 1 {
-        ui.add_space(8.0);
-        // Show the voice actually speaking, and step from it to the next.
-        let speaking = settings.speech_voice.as_ref().or(status.voice.as_ref());
-        let current = speaking.and_then(|v| voices.iter().position(|x| &x.id == v));
-        let mut label = current.map_or("Default voice".to_owned(), |i| voices[i].name.clone());
-        if let (Some(i), Some((voice, fraction))) = (current, &status.download)
-            && &voices[i].id == voice
-        {
-            // "Alan (UK) · 60 MB" becomes "Alan (UK) · downloading 34%".
-            let name = voices[i].name.split(" · ").next().unwrap_or_default();
-            label = if *fraction < 0.0 {
-                format!("{name} · couldn't download")
-            } else {
-                format!("{name} · downloading {:.0}%", fraction * 100.0)
-            };
-        }
-        if let Some(step) = widgets::stepper(ui, Id::unique("voice"), &label, pal) {
-            let next = match current {
-                Some(i) => (i as i32 + step).rem_euclid(voices.len() as i32) as usize,
-                None if step > 0 => 0,
-                None => voices.len() - 1,
-            };
-            settings.speech_voice = Some(voices[next].id.clone());
-        }
-    }
+/// The voice that will read: the one chosen, else the engine's own choice.
+fn current_voice<'s>(settings: &Settings, status: &'s Status) -> Option<&'s VoiceInfo> {
+    let engine = status.engines.first().map_or("", |e| e.id.as_str());
+    let in_engine = |v: &&VoiceInfo| v.engine.is_empty() || v.engine == engine;
+    let chosen = settings
+        .speech_voice
+        .as_ref()
+        .and_then(|c| status.voices.iter().filter(in_engine).find(|v| &v.id == c));
+    chosen.or_else(|| {
+        status.voice.as_ref().and_then(|c| status.voices.iter().filter(in_engine).find(|v| &v.id == c))
+    })
 }
 
 fn voice_prefs(settings: &Settings) -> VoicePrefs {

@@ -78,6 +78,12 @@ impl Store {
     /// Offer a book to the shelf. Books merely found in the books folder (`imported == false`)
     /// stay off it if they were removed before; books the person chose come back regardless.
     pub fn admit(&mut self, path: &Path, imported: bool) -> Admitted {
+        // Books already on the shelf, or removed from it, need not be opened again: the books
+        // folder is checked at every start, and opening each book there takes time.
+        let seen = self.seen.iter().any(|p| p == path);
+        if seen && (self.recent(path).is_some() || !imported) {
+            return self.admit_known(path, None, imported);
+        }
         let meta = book::metadata(path);
         self.admit_known(path, meta, imported)
     }

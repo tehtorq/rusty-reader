@@ -10,6 +10,7 @@ import android.util.Log;
 import com.k2fsa.sherpa.onnx.GeneratedAudio;
 import com.k2fsa.sherpa.onnx.OfflineTts;
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
 
@@ -26,19 +27,41 @@ import java.util.Locale;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
- * Piper's neural voices, run in the app by sherpa-onnx: the same voices as on the desktop, the
- * same on every phone, and offline once downloaded (each is about 60 MB, fetched the first time
- * it is used). Speaks like the system engine does for {@link Narration}: utterances are queued,
- * and each reports when it starts and finishes.
+ * Neural voices, run in the app by sherpa-onnx, offline once downloaded: Piper's (the same as
+ * on the desktop; about 60 MB each) and Kokoro's (more natural still, but heavier: one 360 MB
+ * model holds all of its voices). Voices are downloaded from the voice list, or the first time
+ * one is asked to speak. Speaks like the system engine does for {@link Narration}: utterances
+ * are queued, and each reports when it starts and finishes.
  *
  * One thread turns sentences into audio, a little ahead; another plays them in order.
  */
 final class NaturalVoices {
     private static final String TAG = "RustyReader";
     private static final String MODELS = "https://huggingface.co/csukuangfj/vits-piper-";
+    private static final String KOKORO = "https://huggingface.co/csukuangfj/kokoro-multi-lang-v1_0/resolve/main/";
+    /** Kokoro's voices share one model, kept in this folder. */
+    private static final String KOKORO_DIR = "kokoro-multi-lang-v1_0";
+    private static final String KOKORO_PREFIX = "kokoro-";
 
-    /** The voices offered: Piper's name for each, a label, and its language. */
+    /**
+     * The voices offered: an id, a label, and its language. Piper voices are named as Piper
+     * names them; Kokoro's are "kokoro-" and the voice's name in the model, whose speaker number
+     * is the last field.
+     */
     private static final String[][] CATALOGUE = {
+        {"kokoro-af_heart", "Heart (US)", "en-US", "3"},
+        {"kokoro-af_bella", "Bella (US)", "en-US", "2"},
+        {"kokoro-af_nicole", "Nicole (US)", "en-US", "6"},
+        {"kokoro-af_sarah", "Sarah (US)", "en-US", "9"},
+        {"kokoro-am_michael", "Michael (US)", "en-US", "16"},
+        {"kokoro-am_fenrir", "Fenrir (US)", "en-US", "14"},
+        {"kokoro-am_puck", "Puck (US)", "en-US", "18"},
+        {"kokoro-bf_emma", "Emma (UK)", "en-GB", "21"},
+        {"kokoro-bf_isabella", "Isabella (UK)", "en-GB", "22"},
+        {"kokoro-bf_alice", "Alice (UK)", "en-GB", "20"},
+        {"kokoro-bm_george", "George (UK)", "en-GB", "26"},
+        {"kokoro-bm_fable", "Fable (UK)", "en-GB", "25"},
+        {"kokoro-bm_lewis", "Lewis (UK)", "en-GB", "27"},
         {"en_GB-alan-medium", "Alan (UK)", "en-GB"},
         {"en_GB-jenny_dioco-medium", "Jenny (UK)", "en-GB"},
         {"en_GB-northern_english_male-medium", "Northern English man (UK)", "en-GB"},
@@ -66,6 +89,8 @@ final class NaturalVoices {
     // Only the synthesis thread touches these.
     private OfflineTts tts;
     private String loaded;
+    /** A voice was deleted: let go of the loaded model before speaking again. */
+    private volatile boolean unload;
 
     private final Object trackLock = new Object();
     private AudioTrack track;
@@ -144,16 +169,27 @@ final class NaturalVoices {
         language = tag;
     }
 
-    /**
-     * Choose a voice (null: the first for the book's language). One chosen by name is fetched
-     * straight away, ready for when it is needed; otherwise a voice is fetched when first used.
-     */
+    /** Choose a voice (null: the first for the book's language). One not yet downloaded is
+     *  fetched when first asked to speak. */
     void voice(String name) {
         chosen = name;
-        String voice = current();
-        if (name != null && !downloaded(voice)) {
-            new Thread(() -> download(voice), "natural-voice-download").start();
-        }
+    }
+
+    /** Fetch a voice now, in the background, so it is ready when chosen. */
+    void download(String voice) {
+        new Thread(() -> download(voice, true), "natural-voice-download").start();
+    }
+
+    /** Delete a downloaded voice (for Kokoro, all of its voices: they share one model). */
+    void remove(String voice) {
+        unload = true;
+        delete(voiceDir(voice));
+    }
+
+    private static void delete(File file) {
+        File[] children = file.listFiles();
+        if (children != null) for (File child : children) delete(child);
+        if (!file.delete() && file.exists()) Log.w(TAG, "could not delete " + file);
     }
 
     String current() {
@@ -161,19 +197,27 @@ final class NaturalVoices {
             for (String[] v : CATALOGUE) if (v[0].equals(chosen)) return chosen;
         }
         String lang = language.toLowerCase(Locale.ROOT).replace('_', '-');
-        // A downloaded voice in the book's language, else the first in it, else Alan.
-        for (String[] v : CATALOGUE) if (lang.startsWith(v[2].toLowerCase(Locale.ROOT)) && downloaded(v[0])) return v[0];
-        for (String[] v : CATALOGUE) if (lang.startsWith(v[2].toLowerCase(Locale.ROOT))) return v[0];
-        for (String[] v : CATALOGUE) if (downloaded(v[0])) return v[0];
-        return CATALOGUE[0][0];
+        // Left to choose: a downloaded Piper voice in the book's language, else the first Piper
+        // voice in it, else Alan. (Kokoro is only used when asked for: it is a big download.)
+        for (String[] v : CATALOGUE) {
+            if (!kokoro(v[0]) && lang.startsWith(v[2].toLowerCase(Locale.ROOT)) && downloaded(v[0])) return v[0];
+        }
+        for (String[] v : CATALOGUE) if (!kokoro(v[0]) && lang.startsWith(v[2].toLowerCase(Locale.ROOT))) return v[0];
+        for (String[] v : CATALOGUE) if (!kokoro(v[0]) && downloaded(v[0])) return v[0];
+        return "en_GB-alan-medium";
     }
 
-    /** All the voices, as "name\tlanguage tag\tlabel"; those not yet downloaded say how big. */
+    /**
+     * All the voices, as "name, language tag, label, megabytes still to download, removable
+     * (1 or 0), group, shared (1: the group downloads and deletes as one)", tab-separated.
+     */
     String[] voices() {
         List<String> out = new ArrayList<>();
         for (String[] v : CATALOGUE) {
-            String label = downloaded(v[0]) ? v[1] : v[1] + " · 60 MB";
-            out.add(v[0] + "\t" + v[2] + "\t" + label);
+            boolean have = downloaded(v[0]);
+            int size = have ? 0 : kokoro(v[0]) ? 360 : 60;
+            String group = kokoro(v[0]) ? "Kokoro\t1" : "Piper\t0";
+            out.add(v[0] + "\t" + v[2] + "\t" + v[1] + "\t" + size + "\t" + (have ? 1 : 0) + "\t" + group);
         }
         return out.toArray(new String[0]);
     }
@@ -191,13 +235,19 @@ final class NaturalVoices {
             if (job.generation != generation) continue;
             try {
                 String voice = current();
-                if (!downloaded(voice) && !download(voice)) {
+                if (unload) {
+                    unload = false;
+                    if (tts != null) tts.release();
+                    tts = null;
+                    loaded = null;
+                }
+                if (!downloaded(voice) && !download(voice, false)) {
                     Narration.heard(Narration.FAILED, job.id);
                     continue;
                 }
-                if (!voice.equals(loaded)) load(voice);
+                if (!model(voice).equals(loaded)) load(voice);
                 if (job.generation != generation) continue;
-                GeneratedAudio speech = tts.generate(job.text, 0, rate);
+                GeneratedAudio speech = tts.generate(job.text, speaker(voice), rate);
                 job.samples = speech.getSamples();
                 job.sampleRate = speech.getSampleRate();
                 float pause = job.paragraphEnd ? PARAGRAPH_PAUSE : SENTENCE_PAUSE;
@@ -213,23 +263,53 @@ final class NaturalVoices {
         }
     }
 
+    private static boolean kokoro(String voice) {
+        return voice.startsWith(KOKORO_PREFIX);
+    }
+
+    /**
+     * Which model a voice needs loaded: each Piper voice is its own, while Kokoro's voices
+     * share one, set up for American or British pronunciation.
+     */
+    private static String model(String voice) {
+        if (!kokoro(voice)) return voice;
+        return voice.startsWith(KOKORO_PREFIX + "b") ? "kokoro-gb" : "kokoro-us";
+    }
+
+    /** The speaker within the model. */
+    private static int speaker(String voice) {
+        for (String[] v : CATALOGUE) if (v[0].equals(voice) && v.length > 3) return Integer.parseInt(v[3]);
+        return 0;
+    }
+
     private void load(String voice) throws IOException {
         if (tts != null) tts.release();
         tts = null;
         loaded = null;
         File dir = voiceDir(voice);
-        OfflineTtsVitsModelConfig vits = OfflineTtsVitsModelConfig.builder()
-                .setModel(new File(dir, "model.onnx").getPath())
-                .setTokens(new File(dir, "tokens.txt").getPath())
-                .setDataDir(espeakData().getPath())
-                .build();
-        OfflineTtsModelConfig model = OfflineTtsModelConfig.builder()
-                .setVits(vits)
-                .setNumThreads(Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)))
-                .setDebug(false)
-                .build();
-        tts = new OfflineTts(OfflineTtsConfig.builder().setModel(model).build());
-        loaded = voice;
+        int cores = Runtime.getRuntime().availableProcessors();
+        OfflineTtsModelConfig.Builder model = OfflineTtsModelConfig.builder().setDebug(false);
+        if (kokoro(voice)) {
+            String lexicon = model(voice).equals("kokoro-gb") ? "lexicon-gb-en.txt" : "lexicon-us-en.txt";
+            model.setKokoro(OfflineTtsKokoroModelConfig.builder()
+                            .setModel(new File(dir, "model.onnx").getPath())
+                            .setVoices(new File(dir, "voices.bin").getPath())
+                            .setTokens(new File(dir, "tokens.txt").getPath())
+                            .setLexicon(new File(dir, lexicon).getPath())
+                            .setDataDir(espeakData().getPath())
+                            .build())
+                    // Kokoro is the heavier model: give it more of the phone.
+                    .setNumThreads(Math.max(2, Math.min(6, cores - 2)));
+        } else {
+            model.setVits(OfflineTtsVitsModelConfig.builder()
+                            .setModel(new File(dir, "model.onnx").getPath())
+                            .setTokens(new File(dir, "tokens.txt").getPath())
+                            .setDataDir(espeakData().getPath())
+                            .build())
+                    .setNumThreads(Math.max(1, Math.min(4, cores / 2)));
+        }
+        tts = new OfflineTts(OfflineTtsConfig.builder().setModel(model.build()).build());
+        loaded = model(voice);
     }
 
     // ---- Playing it -------------------------------------------------------------------
@@ -352,24 +432,48 @@ final class NaturalVoices {
     // ---- Files ------------------------------------------------------------------------
 
     private File voiceDir(String voice) {
-        return new File(context.getFilesDir(), "voices/" + voice);
+        return new File(context.getFilesDir(), "voices/" + (kokoro(voice) ? KOKORO_DIR : voice));
+    }
+
+    /** The files a voice needs, as they are named once downloaded. */
+    private static String[] files(String voice) {
+        if (kokoro(voice)) {
+            return new String[] {"tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt", "voices.bin", "model.onnx"};
+        }
+        return new String[] {"tokens.txt", "model.onnx"};
     }
 
     private boolean downloaded(String voice) {
         File dir = voiceDir(voice);
-        return new File(dir, "model.onnx").isFile() && new File(dir, "tokens.txt").isFile();
+        for (String file : files(voice)) if (!new File(dir, file).isFile()) return false;
+        return true;
     }
 
-    /** Fetch a voice (once, however many ask), reporting progress to the reader. */
-    private boolean download(String voice) {
+    /**
+     * Fetch a voice (once, however many ask), reporting progress to the reader. Asked for
+     * outright, it reports even a voice that is already there, so the list catches up.
+     */
+    private boolean download(String voice, boolean asked) {
         synchronized (downloadLock) {
-            if (downloaded(voice)) return true;
+            if (downloaded(voice)) {
+                if (asked) Narration.progress(voice, 1f);
+                return true;
+            }
             File dir = voiceDir(voice);
             dir.mkdirs();
             try {
-                String base = MODELS + voice + "/resolve/main/";
-                fetch(base + "tokens.txt", new File(dir, "tokens.txt"), null);
-                fetch(base + voice + ".onnx", new File(dir, "model.onnx"), voice);
+                // The small files first; the model, which is nearly all of it, shows progress.
+                for (String file : files(voice)) {
+                    File to = new File(dir, file);
+                    if (to.isFile()) continue;
+                    String url;
+                    if (kokoro(voice)) {
+                        url = KOKORO + file;
+                    } else {
+                        url = MODELS + voice + "/resolve/main/" + (file.equals("model.onnx") ? voice + ".onnx" : file);
+                    }
+                    fetch(url, to, file.equals("model.onnx") ? voice : null);
+                }
                 Narration.progress(voice, 1f);
                 return true;
             } catch (IOException e) {

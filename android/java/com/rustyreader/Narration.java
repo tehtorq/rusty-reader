@@ -259,6 +259,16 @@ final class Narration {
         else if (waitReady()) applyVoice();
     }
 
+    /** Download one of the app's own voices. */
+    void download(String voice) {
+        natural().download(voice);
+    }
+
+    /** Delete one of the app's own voices. */
+    void remove(String voice) {
+        natural().remove(voice);
+    }
+
     /** Switch engine (an engine's package, NATURAL, or null for the app's choice). */
     void engine(String name) {
         silence();
@@ -312,12 +322,16 @@ final class Narration {
     }
 
     /**
-     * Voices of the engine in use, as "name\tlanguage tag\tlabel": those that work offline first,
-     * then online ones (often the most natural), best first within each.
+     * Every voice to choose from: the app's own, always, then the phone engine's when one is in
+     * use (offline ones first, then online ones, often the most natural; best first within
+     * each). Each as NaturalVoices.voices() describes, ending with the engine it belongs to.
      */
     String[] voices() {
-        if (useNatural()) return natural().voices();
-        if (!waitReady() || tts.getVoices() == null) return new String[0];
+        List<String> out = new ArrayList<>();
+        for (String v : natural().voices()) out.add(v + "\t" + NATURAL);
+        if (useNatural() || !waitReady() || tts.getVoices() == null) return out.toArray(new String[0]);
+        String engine = runningEngine;
+        String engineName = engineName(engine);
         List<Voice> usable = new ArrayList<>();
         for (Voice v : tts.getVoices()) {
             boolean missing = v.getFeatures() != null
@@ -329,16 +343,26 @@ final class Narration {
                 .thenComparing(v -> -v.getQuality())
                 .thenComparing(Voice::getName));
         Map<String, Integer> counts = new HashMap<>();
-        String[] out = new String[usable.size()];
-        for (int i = 0; i < out.length; i++) {
-            Voice v = usable.get(i);
+        for (Voice v : usable) {
             String place = v.getLocale().getDisplayCountry();
             String region = place.isEmpty() ? v.getLocale().getDisplayLanguage() : place;
             int n = counts.merge(region, 1, Integer::sum);
             String online = v.isNetworkConnectionRequired() ? " (online)" : "";
-            out[i] = v.getName() + "\t" + v.getLocale().toLanguageTag() + "\t" + region + " · voice " + n + online;
+            // Nothing to download, nothing to remove, nothing shared.
+            out.add(v.getName() + "\t" + v.getLocale().toLanguageTag() + "\t" + region + " · voice " + n + online
+                    + "\t0\t0\t" + engineName + "\t0\t" + engine);
         }
-        return out;
+        return out.toArray(new String[0]);
+    }
+
+    /** What an engine calls itself, for headings. */
+    private String engineName(String engine) {
+        android.content.pm.PackageManager pm = activity.getPackageManager();
+        for (android.content.pm.ResolveInfo info : pm.queryIntentServices(
+                new Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0)) {
+            if (info.serviceInfo.packageName.equals(engine)) return info.loadLabel(pm).toString();
+        }
+        return "Phone voices";
     }
 
     // ---- Playing in the background ----------------------------------------------------

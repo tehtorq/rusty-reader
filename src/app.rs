@@ -11,7 +11,7 @@ use crate::library::{self, Action, Covers};
 use crate::meter::Meter;
 use crate::platform;
 use crate::reader::Reader;
-use crate::speech::{Control, Narrator};
+use crate::speech::{Control, Narrator, State};
 use crate::store::{Admitted, Store};
 use crate::theme::ThemeKind;
 
@@ -36,11 +36,21 @@ pub struct App {
     dirty_since: Option<f64>,
     meter: Meter,
     narrator: Narrator,
+    /// When the reader last touched the screen (or a key), and whether the screen is being
+    /// kept on: see `stay_awake`.
+    last_touch: f64,
+    awake: bool,
 }
+
+/// How long an open book keeps the screen on after the last touch, so a reader who falls
+/// asleep doesn't leave it lit all night.
+const AWAKE_FOR: f64 = 10.0 * 60.0;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> App {
+        platform::startup("App::new");
         fonts::install(&cc.egui_ctx);
+        platform::startup("fonts installed");
         if cfg!(target_os = "android") {
             // Scroll like an Android list rather than an iPhone one: stop at the ends instead of
             // rubber-banding, and coast a little less after a flick.
@@ -60,11 +70,16 @@ impl App {
             dirty_since: None,
             meter: Meter::default(),
             narrator: Narrator::default(),
+            last_touch: 0.0,
+            awake: false,
         };
+        platform::startup("state loaded");
         if app.store.fill_keys() {
             app.store.save();
         }
+        platform::startup("keys filled");
         app.shelve_found();
+        platform::startup("books folder checked");
         if let Some(path) = initial {
             app.open(&cc.egui_ctx, path);
         }
@@ -151,8 +166,33 @@ impl App {
     }
 }
 
+impl App {
+    /// Keep the screen on while a book is open and being read: touched lately, or reading
+    /// itself aloud for the reader to follow.
+    fn stay_awake(&mut self, ctx: &egui::Context, now: f64) {
+        let touched = ctx
+            .input(|i| i.pointer.any_down() || i.events.iter().any(|e| matches!(e, egui::Event::Key { .. })));
+        if touched {
+            self.last_touch = now;
+        }
+        let reading = matches!(self.screen, Screen::Reading(_));
+        let listening = reading && self.narrator.status().state == State::Playing;
+        let idle = now - self.last_touch;
+        let awake = reading && (listening || idle < AWAKE_FOR);
+        if awake != self.awake {
+            self.awake = awake;
+            platform::keep_awake(awake);
+        }
+        if awake && !listening {
+            // Nothing else may draw again before the time is up.
+            ctx.request_repaint_after_secs((AWAKE_FOR - idle) as f32 + 0.5);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        platform::started();
         let started = std::time::Instant::now();
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
@@ -241,6 +281,7 @@ impl eframe::App for App {
                 ctx.request_repaint_after_secs(1.6);
             }
         }
+        self.stay_awake(&ctx, now);
         self.meter.record(&ctx, started.elapsed());
     }
 
@@ -251,6 +292,7 @@ impl eframe::App for App {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        platform::startup("first input");
         if let Some(insets) = platform::safe_area(ctx) {
             raw_input.safe_area_insets = Some(insets);
         }

@@ -59,10 +59,53 @@ pub fn refresh_rate() -> Option<f32> {
     }
 }
 
+/// Start-up milestones, logged (on Android) so a launch that never shows its first frame can
+/// be traced: the last one reached says where it stopped.
+static STARTUP: std::sync::Mutex<(Vec<String>, bool)> = std::sync::Mutex::new((Vec::new(), false));
+
+pub fn startup(stage: &str) {
+    if let Ok(mut startup) = STARTUP.lock()
+        && !startup.1
+    {
+        #[cfg(target_os = "android")]
+        log::info!("start-up: {stage}");
+        startup.0.push(stage.to_owned());
+    }
+}
+
+/// The first frame is on screen: start-up is over.
+pub fn started() {
+    if let Ok(mut startup) = STARTUP.lock()
+        && !startup.1
+    {
+        startup.1 = true;
+        #[cfg(target_os = "android")]
+        log::info!("start-up: first frame");
+    }
+}
+
+/// Log how far start-up got, if it hasn't finished.
+pub fn startup_report() {
+    if let Ok(startup) = STARTUP.lock()
+        && !startup.1
+    {
+        #[cfg(target_os = "android")]
+        log::error!("start-up stuck: no first frame yet; got as far as {:?}", startup.0.last());
+    }
+}
+
 /// A short tap of the phone's vibration motor, to confirm a long press did something.
 pub fn buzz() {
     #[cfg(target_os = "android")]
     android::buzz();
+}
+
+/// Keep the screen from dimming and locking itself, or let it again.
+pub fn keep_awake(on: bool) {
+    #[cfg(target_os = "android")]
+    android::keep_awake(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
 }
 
 pub fn leave(ctx: &egui::Context) {
@@ -144,6 +187,18 @@ pub mod android {
     pub fn set_app(app: AndroidApp) {
         let _ = APP.set(app);
         register_natives();
+    }
+
+    /// Ask a newly made activity (not the one in [`app`], which belongs to the process's first
+    /// run) to relaunch the app in a fresh process.
+    pub fn restart_fresh(app: &AndroidApp) {
+        let Ok(vm) = (unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }) else { return };
+        let Ok(mut env) = vm.attach_current_thread_permanently() else { return };
+        let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+        if env.call_method(&activity, "restartFresh", "()V", &[]).is_err() {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
     }
 
     /// Give Java's `Narration.heard` and `Narration.control` their Rust bodies. (Java can't
@@ -315,17 +370,42 @@ pub mod android {
                 for i in 0..env.get_array_length(&list)? {
                     let entry = JString::from(env.get_object_array_element(&list, i)?);
                     let entry = String::from(env.get_string(&entry)?);
-                    if let [id, language, name] = entry.splitn(3, '\t').collect::<Vec<_>>()[..] {
+                    // "id, language, name, megabytes to download, removable, group, shared, engine",
+                    // tab-separated.
+                    if let [id, language, name, mb, removable, group, shared, engine] =
+                        entry.split('\t').collect::<Vec<_>>()[..]
+                    {
                         voices.push(VoiceInfo {
                             id: id.into(),
                             language: language.into(),
                             name: name.into(),
+                            download_mb: mb.parse().unwrap_or(0),
+                            removable: removable == "1",
+                            group: group.into(),
+                            shared: shared == "1",
+                            engine: engine.into(),
                         });
                     }
                 }
                 Ok(voices)
             })
             .unwrap_or_default()
+        }
+
+        fn download(&mut self, voice: &str) {
+            with_activity(|env, activity| {
+                let voice = env.new_string(voice)?;
+                env.call_method(activity, "speechDownload", "(Ljava/lang/String;)V", &[(&voice).into()])
+                    .map(drop)
+            });
+        }
+
+        fn remove(&mut self, voice: &str) {
+            with_activity(|env, activity| {
+                let voice = env.new_string(voice)?;
+                env.call_method(activity, "speechRemove", "(Ljava/lang/String;)V", &[(&voice).into()])
+                    .map(drop)
+            });
         }
 
         fn now_playing(&mut self, state: State, title: &str, author: Option<&str>) {
@@ -359,6 +439,9 @@ pub mod android {
         let fresh = cache.is_some_and(|(at, _)| at.elapsed() < Duration::from_millis(500));
         if !fresh {
             let insets = system_insets().or(cache.map(|(_, i)| i))?;
+            if cache.is_some_and(|(_, old)| old != insets) {
+                log::info!("insets changed: {:?} -> {insets:?}", cache.map(|(_, i)| i));
+            }
             *cache = Some((Instant::now(), insets));
         }
         let [left, top, right, bottom] = (*cache)?.1;
@@ -384,6 +467,12 @@ pub mod android {
 
     pub fn buzz() {
         with_activity(|env, activity| env.call_method(activity, "buzz", "()V", &[]).map(drop));
+    }
+
+    pub fn keep_awake(on: bool) {
+        with_activity(|env, activity| {
+            env.call_method(activity, "keepAwake", "(Z)V", &[JValue::Bool(on.into())]).map(drop)
+        });
     }
 
     pub fn move_to_back() {
@@ -431,10 +520,12 @@ pub mod android {
             let kind = "android/view/WindowInsets$Type";
             let bars = env.call_static_method(kind, "systemBars", "()I", &[])?.i()?;
             let cutout = env.call_static_method(kind, "displayCutout", "()I", &[])?.i()?;
+            // Where the bars sit whether or not they are showing at this moment: a bar that
+            // flickers into view (a swipe from the edge) mustn't shift the page.
             let insets = env
                 .call_method(
                     &insets,
-                    "getInsets",
+                    "getInsetsIgnoringVisibility",
                     "(I)Landroid/graphics/Insets;",
                     &[JValue::Int(bars | cutout)],
                 )?

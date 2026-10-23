@@ -187,6 +187,10 @@ pub trait Voice: Send {
     fn set_engine(&mut self, _engine: Option<&str>) {}
     /// The book being read, for lock-screen controls.
     fn now_playing(&mut self, _state: State, _title: &str, _author: Option<&str>) {}
+    /// Fetch a voice that needs downloading, reporting through [`download_progress`].
+    fn download(&mut self, _voice: &str) {}
+    /// Delete a downloaded voice.
+    fn remove(&mut self, _voice: &str) {}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +199,16 @@ pub struct VoiceInfo {
     /// A BCP 47 language tag.
     pub language: String,
     pub name: String,
+    /// Megabytes to download before it can speak; 0 once it can.
+    pub download_mb: u32,
+    /// It was downloaded, and can be deleted again.
+    pub removable: bool,
+    /// The family it belongs to, as a heading for a list of voices ("" for none).
+    pub group: String,
+    /// The whole group is one download: fetching or deleting one voice does them all.
+    pub shared: bool,
+    /// The engine it belongs to, as in [`Voice::engines`] ("" where there is only one).
+    pub engine: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,6 +323,10 @@ enum Msg {
     Heard(Heard),
     Download(String, f32),
     Failure(String),
+    /// Get ready to list voices for a book in this language, without reading yet.
+    Prepare(String),
+    Fetch(String),
+    Remove(String),
     /// Stop, and say so once silent.
     Halt(Sender<()>),
 }
@@ -335,6 +353,27 @@ impl Narrator {
         offset: usize,
         prefs: VoicePrefs,
     ) {
+        self.start(ctx, prefs);
+        self.send(Msg::Play { book, path, chapter, offset });
+    }
+
+    /// Start the engine, if it hasn't been, and list its voices for a book in `language`.
+    pub fn prepare(&mut self, ctx: &egui::Context, language: &str, prefs: VoicePrefs) {
+        self.start(ctx, prefs);
+        self.send(Msg::Prepare(language.to_owned()));
+    }
+
+    /// Download a voice; [`Status::download`] follows along.
+    pub fn download(&self, voice: &str) {
+        self.send(Msg::Fetch(voice.to_owned()));
+    }
+
+    /// Delete a downloaded voice.
+    pub fn remove(&self, voice: &str) {
+        self.send(Msg::Remove(voice.to_owned()));
+    }
+
+    fn start(&mut self, ctx: &egui::Context, prefs: VoicePrefs) {
         if self.tx.is_none() {
             let (tx, rx) = channel();
             if let Ok(mut inbox) = INBOX.lock() {
@@ -348,7 +387,6 @@ impl Narrator {
                 .ok();
             self.tx = Some(tx);
         }
-        self.send(Msg::Play { book, path, chapter, offset });
     }
 
     pub fn control(&self, control: Control) {
@@ -450,9 +488,27 @@ impl Worker {
                 Msg::Download(voice, fraction) => {
                     self.publish(|s| s.download = (fraction < 1.0).then_some((voice, fraction)));
                     if fraction >= 1.0 {
-                        // Downloaded: its name no longer needs to say how big it is.
+                        // Downloaded: ready to speak.
                         self.list_voices();
                     }
+                }
+                Msg::Prepare(language) => {
+                    if self.language.as_ref() != Some(&language) {
+                        self.voice.set_language(&language);
+                        self.language = Some(language);
+                    }
+                    self.list_voices();
+                }
+                Msg::Fetch(voice) => {
+                    self.publish(|s| s.download = Some((voice.clone(), 0.0)));
+                    self.voice.download(&voice);
+                }
+                Msg::Remove(voice) => {
+                    if self.state != State::Idle && self.voice.current_voice().as_ref() == Some(&voice) {
+                        self.control(Control::Stop);
+                    }
+                    self.voice.remove(&voice);
+                    self.list_voices();
                 }
                 Msg::Heard(Heard::Started(id)) => {
                     if let Some(&(_, chapter, index)) = self.queued.iter().find(|q| q.0 == id) {
@@ -499,6 +555,11 @@ impl Worker {
         self.queued.clear();
         let index = self.sentences(chapter).partition_point(|s| s.end <= offset);
         self.next = (chapter, index);
+        // Here, from now on: not the sentence the voice was saying, while it gets this one ready.
+        if let Some(sentence) = self.sentences(chapter).get(index) {
+            let at = Spot { chapter, start: sentence.start, end: sentence.end };
+            self.publish(|s| s.at = Some(at));
+        }
         self.set_state(State::Playing);
         self.fill();
     }

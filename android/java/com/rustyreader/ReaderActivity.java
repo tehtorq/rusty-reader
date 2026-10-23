@@ -68,7 +68,12 @@ public class ReaderActivity extends NativeActivity {
     @Override
     protected void onDestroy() {
         // Closing the app closes the book, voice and all.
-        if (isFinishing()) Narration.closed();
+        Narration.closed();
+        // Then the process goes too. NativeActivity's onDestroy waits for the Rust side to
+        // finish, which it doesn't (its window system can't be stopped, or started again in
+        // the same process), so Android, opening the app again into this process, would hang
+        // on a black screen. The reading place is already saved: the next launch starts afresh.
+        android.os.Process.killProcess(android.os.Process.myPid());
         super.onDestroy();
     }
 
@@ -94,12 +99,27 @@ public class ReaderActivity extends NativeActivity {
     public void speechEngine(String name) { narration.engine(name); }
     public String[] speechEngines() { return narration.engines(); }
     public String speechCurrentVoice() { return narration.currentVoice(); }
+    public void speechDownload(String voice) { narration.download(voice); }
+    public void speechRemove(String voice) { narration.remove(voice); }
     public void nowPlaying(int state, String title, String author) { narration.nowPlaying(state, title, author); }
+
+    /** Called from Rust when this process already ran the app: start again in a fresh one. */
+    public void restartFresh() {
+        RestartActivity.restart(this);
+    }
 
     /** Called from Rust: a short buzz, as for any long press. */
     public void buzz() {
         runOnUiThread(() -> getWindow().getDecorView()
                 .performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS));
+    }
+
+    /** Called from Rust: keep the screen on (while a book is open), or let it sleep again. */
+    public void keepAwake(boolean on) {
+        runOnUiThread(() -> {
+            if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        });
     }
 
     /** Called from Rust: show the system document picker. */
